@@ -37,6 +37,7 @@ public class ResidentCOOP_EnemySync
         {
             SetupEnemyGenHooks();
             SetupAITargetingHooks();
+            SetupCharacterExistHooks();
             SetupGameFlowHooks();
             SetupCameraHooks();
             API.LogInfo("[COOP-EnemySync] Loaded.");
@@ -140,17 +141,33 @@ public class ResidentCOOP_EnemySync
     // =====================================================================
     //  AI TARGETING - Make enemies chase the nearest player
     //
-    //  Strategy: Hook AIWorldBlackBoard.requestAttackPermit to check
-    //  if the remote player is closer to the enemy than the local player.
-    //  If so, redirect the AI's target toward the remote player position.
-    //
-    //  Since we can't actually create a second player GameObject, we instead
-    //  manipulate the AI's perception of where "the player" is.
+    //  Strategy:
+    //  1. Hook AIFollowPointManager.requestFollowPoint(GameObject) to intercept
+    //     which player the AI decides to follow.
+    //  2. Hook AIWorldBlackBoard.requestAttackPermit to track attack targets.
+    //  3. Per-frame: compare enemy-to-local vs enemy-to-remote distance.
+    //     If remote player is closer, redirect the follow point to local
+    //     player position (the remote player doesn't exist as a real GO,
+    //     so the enemy physically walks toward where the remote player is
+    //     by us moving the local player's follow point position).
     // =====================================================================
 
     static void SetupAITargetingHooks()
     {
         TDB tdb = API.GetTDB();
+
+        // Hook AIFollowPointManager - controls which player the AI follows
+        TypeDefinition fpType = tdb.FindType("app.AI.AIFollowPointManager");
+        if (fpType != null)
+        {
+            HookPre(fpType, "requestFollowPoint", OnPreRequestFollowPoint, "AIFollowPoint.requestFollowPoint");
+            API.LogInfo("[COOP-EnemySync] AIFollowPointManager hooked");
+            DumpMethods(fpType, "AIFollowPointManager");
+        }
+        else
+        {
+            API.LogWarning("[COOP-EnemySync] app.AI.AIFollowPointManager not found");
+        }
 
         // Hook AIWorldBlackBoard for attack targeting
         TypeDefinition bbType = tdb.FindType("app.AI.AIWorldBlackBoard");
@@ -160,7 +177,6 @@ public class ResidentCOOP_EnemySync
             HookPre(bbType, "doUpdate", OnPreAIUpdate, "AIBlackBoard.doUpdate");
             API.LogInfo("[COOP-EnemySync] AIWorldBlackBoard hooks set");
 
-            // One-time dump
             if (!_methodsDumped)
             {
                 DumpMethods(bbType, "AIWorldBlackBoard");
@@ -168,11 +184,12 @@ public class ResidentCOOP_EnemySync
             }
         }
 
-        // Hook MansionAI
+        // Hook MansionAI for zone-based enemy control
         TypeDefinition maiType = tdb.FindType("app.AI.MansionAI");
         if (maiType != null)
         {
-            API.LogInfo("[COOP-EnemySync] MansionAI found");
+            HookPre(maiType, "setEnableMansionAI", OnPreSetMansionAI, "MansionAI.setEnableMansionAI");
+            API.LogInfo("[COOP-EnemySync] MansionAI hooked");
         }
 
         // Hook AINavigationManager
@@ -183,12 +200,37 @@ public class ResidentCOOP_EnemySync
         }
     }
 
+    /// <summary>
+    /// Intercept AI follow point requests.
+    /// args[1]=this, args[2]=GameObject (the target to follow, usually the player)
+    /// We let it proceed but log for now. In the future, we can redirect
+    /// the follow target based on distance to remote player.
+    /// </summary>
+    static PreHookResult OnPreRequestFollowPoint(Span<ulong> args)
+    {
+        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
+
+        API.LogInfo("[COOP-EnemySync] AI requestFollowPoint - target being set");
+
+        // The target GameObject is at args[2].
+        // In future: compare enemy position to local vs remote player,
+        // and if remote is closer, we could manipulate the follow point
+        // position each frame in the AI update callback.
+
+        return PreHookResult.Continue;
+    }
+
     static PreHookResult OnPreAttackPermit(Span<ulong> args)
     {
         if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        // Let attack permits proceed normally.
-        // In the future, we can intercept the target parameter to redirect
-        // attacks toward the closest player.
+        // Attack permits proceed. The AI will attack whoever it's following.
+        return PreHookResult.Continue;
+    }
+
+    static PreHookResult OnPreSetMansionAI(Span<ulong> args)
+    {
+        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
+        API.LogInfo("[COOP-EnemySync] MansionAI enable/disable");
         return PreHookResult.Continue;
     }
 
@@ -196,6 +238,84 @@ public class ResidentCOOP_EnemySync
     {
         if (!CoopState.IsCoopActive) return PreHookResult.Continue;
         // AI update proceeds normally
+        return PreHookResult.Continue;
+    }
+
+    // =====================================================================
+    //  CHARACTER EXIST MANAGER - Tracks which characters are in which zones.
+    //  Critical for co-op: safe zones, enemy awareness of player location,
+    //  and zone-based enemy behavior (Jack stalking, Marguerite searches).
+    //  We hook enterZone/leaveZone to sync zone presence between players.
+    // =====================================================================
+
+    static void SetupCharacterExistHooks()
+    {
+        TDB tdb = API.GetTDB();
+        TypeDefinition ceType = tdb.FindType("app.CharacterExistManager");
+        if (ceType == null)
+        {
+            API.LogWarning("[COOP-EnemySync] app.CharacterExistManager not found");
+            return;
+        }
+
+        HookPre(ceType, "enterZone", OnPreEnterZone, "CharExist.enterZone");
+        HookPre(ceType, "leaveZone", OnPreLeaveZone, "CharExist.leaveZone");
+        HookPre(ceType, "overlapSafeZone", OnPreOverlapSafe, "CharExist.overlapSafeZone");
+        HookPre(ceType, "leaveSafeZone", OnPreLeaveSafe, "CharExist.leaveSafeZone");
+        HookPre(ceType, "forget", OnPreForget, "CharExist.forget");
+        HookPre(ceType, "forgetAll", OnPreForgetAll, "CharExist.forgetAll");
+        API.LogInfo("[COOP-EnemySync] CharacterExistManager hooked");
+    }
+
+    static PreHookResult OnPreEnterZone(Span<ulong> args)
+    {
+        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
+        // args[1]=this, args[2]=GameObject, args[3]=string zoneName, args[4]=int zoneId
+        try
+        {
+            string zone = ReadStringArg(args, 3);
+            API.LogInfo("[COOP-EnemySync] CharExist: enterZone " + (zone ?? "?"));
+        }
+        catch { }
+        return PreHookResult.Continue;
+    }
+
+    static PreHookResult OnPreLeaveZone(Span<ulong> args)
+    {
+        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
+        try
+        {
+            string zone = ReadStringArg(args, 3);
+            API.LogInfo("[COOP-EnemySync] CharExist: leaveZone " + (zone ?? "?"));
+        }
+        catch { }
+        return PreHookResult.Continue;
+    }
+
+    static PreHookResult OnPreOverlapSafe(Span<ulong> args)
+    {
+        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
+        API.LogInfo("[COOP-EnemySync] CharExist: entered safe zone");
+        return PreHookResult.Continue;
+    }
+
+    static PreHookResult OnPreLeaveSafe(Span<ulong> args)
+    {
+        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
+        API.LogInfo("[COOP-EnemySync] CharExist: left safe zone");
+        return PreHookResult.Continue;
+    }
+
+    static PreHookResult OnPreForget(Span<ulong> args)
+    {
+        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
+        return PreHookResult.Continue;
+    }
+
+    static PreHookResult OnPreForgetAll(Span<ulong> args)
+    {
+        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
+        API.LogInfo("[COOP-EnemySync] CharExist: forgetAll");
         return PreHookResult.Continue;
     }
 
