@@ -1,0 +1,9 @@
+c:\Users\Justadri\Desktop\re7coop-main\ResidentCOOP.Shared\bin\Release\net8.0\ResidentCOOP.Shared.deps.json
+c:\Users\Justadri\Desktop\re7coop-main\ResidentCOOP.Shared\bin\Release\net8.0\ResidentCOOP.Shared.dll
+c:\Users\Justadri\Desktop\re7coop-main\ResidentCOOP.Shared\bin\Release\net8.0\ResidentCOOP.Shared.pdb
+c:\Users\Justadri\Desktop\re7coop-main\ResidentCOOP.Shared\obj\Release\net8.0\ResidentCOOP.Shared.GeneratedMSBuildEditorConfig.editorconfig
+c:\Users\Justadri\Desktop\re7coop-main\ResidentCOOP.Shared\obj\Release\net8.0\ResidentCOOP.Shared.csproj.CoreCompileInputs.cache
+c:\Users\Justadri\Desktop\re7coop-main\ResidentCOOP.Shared\obj\Release\net8.0\ResidentCOOP.Shared.dll
+c:\Users\Justadri\Desktop\re7coop-main\ResidentCOOP.Shared\obj\Release\net8.0\refint\ResidentCOOP.Shared.dll
+c:\Users\Justadri\Desktop\re7coop-main\ResidentCOOP.Shared\obj\Release\net8.0\ResidentCOOP.Shared.pdb
+c:\Users\Justadri\Desktop\re7coop-main\ResidentCOOP.Shared\obj\Release\net8.0\ref\ResidentCOOP.Shared.dll

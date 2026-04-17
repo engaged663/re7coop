@@ -293,6 +293,12 @@ public class ResidentCOOP_LoadSync
                     {
                         _asyncLoadMgr.Call("requestActivate", VM.CreateString(scene), true);
                         API.LogInfo("[COOP-LoadSync] Client requestActivate: " + scene);
+
+                        // Scene transition on the client: re-run the starting-items flow so
+                        // the client also receives knife + handgun + ammo for the new chapter.
+                        // Same behaviour as host's PerformChapterJump which also clears this flag.
+                        CoopState.StartingItemsGiven = false;
+                        CoopState.InventoryStableFrames = 0;
                     }
                     else
                     {
@@ -300,6 +306,7 @@ public class ResidentCOOP_LoadSync
                         API.LogInfo("[COOP-LoadSync] Client requestLoad: " + scene);
                     }
                 }
+
                 catch (Exception e)
                 {
                     API.LogError("[COOP-LoadSync] Client scene load error: " + e.Message);

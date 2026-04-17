@@ -1,22 +1,25 @@
 // ResidentCOOP_GameSession.cs
 // Game session management using app.GameManager singleton.
 //
+// NEW DESIGN (simplified):
+//   - The mod NEVER tries to auto-start a new game or auto-load a save.
+//     Trying to call newGameRequest directly while the title screen is
+//     showing does NOT close the title UI — it only broke the title menu.
+//   - Instead: when the user clicks "Start Hosting" we just fire up the
+//     network server and go straight to the Hosting screen. The user then
+//     clicks "New Game" or "Continue" on RE7's native title menu as usual.
+//     Co-op detects the player spawning and activates automatically.
+//   - The requestPause block is only active when we have a real partner
+//     connected AND we are actually in-game (player GameObject exists).
+//     In the title screen, pause is left alone so the title menu works.
+//
 // Key methods on app.GameManager:
-//   newGameRequest()                    - Start a new game
-//   newGameInitParam(bool)              - Init new game params
-//   set_gameDifficulty(Difficulty)      - Set difficulty before new game
 //   chapterJumpRequest(string,bool,str) - Jump to a specific chapter
-//   loadInit()                          - Initialize loading
-//   get_IsSceneLoading()               - Check if scene is loading
-//   get_LoadingProgress()              - Loading progress
-//   sceneLoadAllEnd()                  - Signal all scene loads done
+//   getChapterJumpDataKey(ChapterNo)   - Map enum value -> key string
+//   get_IsSceneLoading()               - Check if a scene is loading
+//   get_CurrentChapter()               - Read current ChapterNo
 //   exitFoundFootage()                 - Exit found footage mode
 //   isFoundFootage()                   - Check if in found footage
-//   getPlayer()                        - Get player object
-//   requestPause(PauseRequestType)     - Pause (menu still works, game won't freeze)
-//   requestReleasePause(PauseReqType)  - Release pause
-//
-// For save loading: app.SaveDataManager (methods discovered at runtime)
 
 using System;
 using System.Collections.Generic;
@@ -28,16 +31,34 @@ using ResidentCOOP.Shared;
 
 public class ResidentCOOP_GameSession
 {
-    static bool _initialized = false;
     static ManagedObject _gameManager = null;
-
-    // Discovered save methods
-    static string _checkSaveExistsMethod = null;
-    static string _loadSaveMethod = null;
 
     [PluginEntryPoint]
     public static void Main()
     {
+        // Refined pause-prevention hook: only block pauses while a partner is
+        // actually connected and we are actually in-game (player GO exists).
+        // This keeps the RE7 title menu fully functional.
+        try
+        {
+            TDB tdb = API.GetTDB();
+            TypeDefinition gmType = tdb?.FindType("app.GameManager");
+            if (gmType != null)
+            {
+                Method reqPause = gmType.GetMethod("requestPause");
+                if (reqPause != null)
+                {
+                    MethodHook.Create(reqPause, false).AddPre(
+                        new MethodHook.PreHookDelegate(OnPreRequestPause));
+                    API.LogInfo("[COOP-GameSession] Hooked GM.requestPause (contextual pause prevention)");
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            API.LogWarning("[COOP-GameSession] Could not hook requestPause: " + e.Message);
+        }
+
         API.LogInfo("[COOP-GameSession] Loaded.");
     }
 
@@ -46,6 +67,42 @@ public class ResidentCOOP_GameSession
     {
         API.LogInfo("[COOP-GameSession] Unloaded.");
     }
+
+    /// <summary>
+    /// Block pause requests only when both sides are connected AND we are actually
+    /// in-game. This allows the title menu to function normally while we're "hosting"
+    /// but the partner hasn't joined and/or we're not yet in-game.
+    /// </summary>
+    static PreHookResult OnPreRequestPause(Span<ulong> args)
+    {
+        // Not actively co-op playing → let the game pause however it wants.
+        if (CoopState.Status != ConnectionStatus.Connected) return PreHookResult.Continue;
+        if (!IsPlayerInGame()) return PreHookResult.Continue;
+
+        // Real co-op play + in-game → block the pause so the partner doesn't freeze.
+        return PreHookResult.Skip;
+    }
+
+    /// <summary>
+    /// Returns true when the player GameObject exists in the world (i.e. not in
+    /// a menu/title). Used for pause gating and starting-items gating.
+    /// </summary>
+    public static bool IsPlayerInGame()
+    {
+        try
+        {
+            dynamic om = API.GetManagedSingleton("app.ObjectManager");
+            if (om == null) return false;
+            dynamic player = (om as ManagedObject).GetField("PlayerObj");
+            return player != null;
+        }
+        catch { return false; }
+    }
+
+    // Pending chapter jump (after new game loads / Force Sync to Host)
+    static bool _chapterJumpPending = false;
+    static int _chapterJumpTarget = 0;
+    static int _chapterJumpDelayFrames = 0;
 
     [Callback(typeof(UpdateBehavior), CallbackType.Pre)]
     public static void OnUpdate()
@@ -58,26 +115,48 @@ public class ResidentCOOP_GameSession
                 InitGameManager();
             }
 
-            // One-time: dump SaveDataManager methods
-            if (!_initialized)
-            {
-                DumpSaveDataManagerMethods();
-                _initialized = true;
-            }
-
-            // Scan save slots when needed
-            if (!CoopState.SaveSlotsScanned &&
-                (CoopState.CurrentScreen == UIScreen.HostNewOrLoad ||
-                 CoopState.CurrentScreen == UIScreen.HostLoadGame))
-            {
-                ScanSaveSlots();
-            }
-
-            // Process session start
+            // Process session start (user clicked "Start Hosting").
             if (CoopState.SessionStartRequested && !CoopState.SessionStarted)
             {
                 CoopState.SessionStartRequested = false;
-                ProcessSessionStart();
+                MarkSessionStarted();
+            }
+
+            // Process a pending chapter jump (force sync to host).
+            if (_chapterJumpPending && _gameManager != null)
+            {
+                if (_chapterJumpDelayFrames > 0)
+                {
+                    _chapterJumpDelayFrames--;
+                }
+                else
+                {
+                    PerformChapterJump(_chapterJumpTarget);
+                    _chapterJumpPending = false;
+                }
+            }
+
+            // Force-sync to host (triggered from the UI)
+            if (CoopState.ForceSyncToHostRequested)
+            {
+                CoopState.ForceSyncToHostRequested = false;
+                if (CoopState.HostCurrentChapter >= 0)
+                {
+                    _chapterJumpPending = true;
+                    _chapterJumpTarget = CoopState.HostCurrentChapter;
+                    _chapterJumpDelayFrames = 10;
+                    CoopState.StatusMessage = "Syncing to host's chapter...";
+                    API.LogInfo("[COOP-GameSession] ForceSyncToHost -> ChapterNo " + CoopState.HostCurrentChapter);
+                }
+            }
+
+            // Continuously update LocalCurrentChapter so other plugins / UI can read it.
+            UpdateLocalChapterCache();
+
+            // Give starting items once the local player spawns (only the first time).
+            if (CoopState.IsCoopActive && !CoopState.StartingItemsGiven && _gameManager != null)
+            {
+                TryGiveStartingItems();
             }
         }
         catch (Exception e)
@@ -105,344 +184,77 @@ public class ResidentCOOP_GameSession
         catch { }
     }
 
-    // =====================================================================
-    //  SAVE DATA MANAGER INTROSPECTION
-    // =====================================================================
-
-    static void DumpSaveDataManagerMethods()
-    {
-        try
-        {
-            dynamic saveMgr = API.GetManagedSingleton("app.SaveDataManager");
-            if (saveMgr == null)
-            {
-                API.LogWarning("[COOP-GameSession] app.SaveDataManager not found");
-                return;
-            }
-
-            ManagedObject smMO = saveMgr as ManagedObject;
-            TypeDefinition smType = smMO.GetTypeDefinition();
-            if (smType == null) return;
-
-            API.LogInfo("[COOP-GameSession] === SaveDataManager: " + smType.GetFullName() + " ===");
-
-            var methods = smType.GetMethods();
-            if (methods != null)
-            {
-                for (int i = 0; i < methods.Count; i++)
-                {
-                    string name = methods[i].GetName();
-                    string lower = name.ToLower();
-
-                    // Detect check-exists method
-                    if (lower.Contains("exist") || lower.Contains("issave") || lower.Contains("hassave") || lower.Contains("isvalid"))
-                    {
-                        if (_checkSaveExistsMethod == null)
-                        {
-                            _checkSaveExistsMethod = name;
-                            API.LogInfo("[COOP-GameSession]   >> Check exists: " + name);
-                        }
-                    }
-
-                    // Detect load method
-                    if (lower.Contains("load") && !lower.Contains("unload") && !lower.Contains("reload") && !lower.Contains("isload") && !lower.Contains("getload"))
-                    {
-                        if (_loadSaveMethod == null)
-                        {
-                            _loadSaveMethod = name;
-                            API.LogInfo("[COOP-GameSession]   >> Load method: " + name);
-                        }
-                    }
-                }
-            }
-
-            API.LogInfo("[COOP-GameSession] === End SaveDataManager ===");
-        }
-        catch (Exception e)
-        {
-            API.LogError("[COOP-GameSession] SaveDataManager dump error: " + e.Message);
-        }
-    }
-
-    // =====================================================================
-    //  SAVE SLOT SCANNING
-    // =====================================================================
-
-    static void ScanSaveSlots()
-    {
-        try
-        {
-            dynamic saveMgr = API.GetManagedSingleton("app.SaveDataManager");
-            if (saveMgr != null && _checkSaveExistsMethod != null)
-            {
-                ScanSaveSlotsWithMethod(saveMgr as ManagedObject);
-            }
-            else
-            {
-                ScanSaveSlotsViaOptionManager();
-            }
-            CoopState.SaveSlotsScanned = true;
-        }
-        catch (Exception e)
-        {
-            API.LogError("[COOP-GameSession] ScanSaveSlots: " + e.Message);
-            CoopState.SaveSlotsScanned = true;
-        }
-    }
-
-    static void ScanSaveSlotsWithMethod(ManagedObject saveMgr)
-    {
-        int found = 0;
-        for (int slot = 0; slot < 21; slot++)
-        {
-            bool exists = false;
-            // Try with slot directly, and slot+1
-            try { exists = (bool)saveMgr.Call(_checkSaveExistsMethod, slot); } catch { }
-            if (!exists)
-            {
-                try { exists = (bool)saveMgr.Call(_checkSaveExistsMethod, slot + 1); } catch { }
-            }
-
-            CoopState.SaveSlotExists[slot] = exists;
-            CoopState.SaveSlotNames[slot] = exists ? ("Save Slot " + (slot + 1)) : "(Empty)";
-            if (exists) found++;
-        }
-        CoopState.SaveSlotCount = found;
-        API.LogInfo("[COOP-GameSession] Scan: " + found + " saves found");
-    }
-
-    static void ScanSaveSlotsViaOptionManager()
-    {
-        try
-        {
-            dynamic optMgr = API.GetManagedSingleton("app.OptionManager");
-            if (optMgr == null) { CoopState.SaveSlotCount = 0; return; }
-
-            bool hasAny = false;
-            try { hasAny = (bool)optMgr._HasAnySave; } catch { }
-
-            if (hasAny)
-            {
-                CoopState.SaveSlotExists[0] = true;
-                CoopState.SaveSlotNames[0] = "Continue (Latest Save)";
-                CoopState.SaveSlotCount = 1;
-            }
-            else
-            {
-                CoopState.SaveSlotCount = 0;
-            }
-        }
-        catch { CoopState.SaveSlotCount = 0; }
-    }
-
-    // =====================================================================
-    //  SESSION START
-    // =====================================================================
-
-    static void ProcessSessionStart()
-    {
-        switch (CoopState.StartMode)
-        {
-            case SessionStartMode.NewGame:
-                StartNewGame();
-                break;
-            case SessionStartMode.LoadSave:
-                LoadSaveGame();
-                break;
-            case SessionStartMode.ContinueCurrentGame:
-                ContinueCurrentGame();
-                break;
-        }
-    }
-
     /// <summary>
-    /// Start a new game using app.GameManager.
-    /// Flow: set_gameDifficulty -> newGameInitParam(true) -> newGameRequest()
+    /// Reads the current ChapterNo from the GameManager and caches it into CoopState.
+    /// Called every update tick (cheap call).
     /// </summary>
-    static void StartNewGame()
+    static void UpdateLocalChapterCache()
     {
-        API.LogInfo("[COOP-GameSession] NewGame requested, difficulty=" + CoopState.Difficulty);
-
-        if (_gameManager == null)
-        {
-            InitGameManager();
-        }
-
-        if (_gameManager != null)
-        {
-            try
-            {
-                // Set difficulty first
-                // app.GameManager.Difficulty enum: we pass it as int
-                try { _gameManager.Call("set_gameDifficulty", (int)CoopState.Difficulty); }
-                catch
-                {
-                    try { _gameManager.Call("set_gameDifficulty", (long)CoopState.Difficulty); }
-                    catch (Exception de) { API.LogWarning("[COOP-GameSession] set_gameDifficulty: " + de.Message); }
-                }
-
-                // Init new game parameters
-                try { _gameManager.Call("newGameInitParam", true); }
-                catch (Exception pe) { API.LogWarning("[COOP-GameSession] newGameInitParam: " + pe.Message); }
-
-                // Fire the new game request
-                try
-                {
-                    _gameManager.Call("newGameRequest");
-                    API.LogInfo("[COOP-GameSession] newGameRequest() called successfully!");
-                    CoopState.StatusMessage = "New game starting...";
-                    CoopState.SessionStarted = true;
-                    return;
-                }
-                catch (Exception ne)
-                {
-                    API.LogError("[COOP-GameSession] newGameRequest failed: " + ne.Message);
-                }
-            }
-            catch (Exception e)
-            {
-                API.LogError("[COOP-GameSession] NewGame error: " + e.Message);
-            }
-        }
-
-        // Fallback: try GameFlowFsmManager.requestStartGameFlow
+        if (_gameManager == null) return;
         try
         {
-            dynamic gfm = API.GetManagedSingleton("app.GameFlowFsmManager");
-            if (gfm != null)
+            dynamic ch = _gameManager.Call("get_CurrentChapter");
+            if (ch != null)
             {
-                ManagedObject gfmMO = gfm as ManagedObject;
-                // GameFlowKindEnum values: try 0 (main story)
-                try { gfmMO.Call("requestStartGameFlow", 0); }
-                catch { try { gfmMO.Call("requestStartGameFlow", (long)0); } catch { } }
-
-                try { gfmMO.Call("startGameFlow", true); }
-                catch { try { gfmMO.Call("startGameFlow", false); } catch { } }
-
-                API.LogInfo("[COOP-GameSession] Fallback: GameFlowFsmManager.requestStartGameFlow(0)");
-                CoopState.StatusMessage = "New game starting via GameFlow...";
-                CoopState.SessionStarted = true;
-                return;
+                try { CoopState.LocalCurrentChapter = (int)ch; }
+                catch { try { CoopState.LocalCurrentChapter = (int)(long)ch; } catch { } }
             }
         }
         catch { }
-
-        CoopState.SessionStarted = true;
-        CoopState.StatusMessage = "Could not auto-start. Please start New Game from title screen.";
     }
 
     /// <summary>
-    /// Load a save game using app.SaveDataManager.
-    /// The user confirmed a load method was found in the logs.
+    /// Public read of the local player's current chapter enum value. Used by Core.cs
+    /// when sending the HandshakeAck to the client.
     /// </summary>
-    static void LoadSaveGame()
+    public static int GetCurrentChapter()
     {
-        int slot = CoopState.SaveSlotToLoad;
-        API.LogInfo("[COOP-GameSession] LoadSave slot=" + slot);
-
-        if (_loadSaveMethod == null)
-        {
-            CoopState.StatusMessage = "No load method found. Load save manually from title screen.";
-            CoopState.SessionStarted = true;
-            return;
-        }
-
-        try
-        {
-            dynamic saveMgr = API.GetManagedSingleton("app.SaveDataManager");
-            if (saveMgr != null)
-            {
-                ManagedObject smMO = saveMgr as ManagedObject;
-
-                // Try slot directly and slot+1
-                bool loaded = false;
-                try { smMO.Call(_loadSaveMethod, slot); loaded = true; }
-                catch
-                {
-                    try { smMO.Call(_loadSaveMethod, slot + 1); loaded = true; }
-                    catch
-                    {
-                        try { smMO.Call(_loadSaveMethod, (long)slot); loaded = true; }
-                        catch
-                        {
-                            try { smMO.Call(_loadSaveMethod, (long)(slot + 1)); loaded = true; }
-                            catch { }
-                        }
-                    }
-                }
-
-                if (loaded)
-                {
-                    API.LogInfo("[COOP-GameSession] " + _loadSaveMethod + " called for slot " + slot);
-
-                    // After requesting load, tell GameManager + AsyncLoadManager to proceed
-                    if (_gameManager != null)
-                    {
-                        try { _gameManager.Call("loadInit"); API.LogInfo("[COOP-GameSession] loadInit OK"); }
-                        catch { }
-                    }
-
-                    // Use AsyncLoadManager to activate the game flow from load
-                    try
-                    {
-                        dynamic alm = API.GetManagedSingleton("app.AsyncLoadManager");
-                        if (alm != null)
-                        {
-                            ManagedObject almMO = alm as ManagedObject;
-                            // Try requestGameFlowCtrlActivefromLoad with chapter param
-                            try { almMO.Call("requestGameFlowCtrlActivefromLoad", 0); API.LogInfo("[COOP-GameSession] AsyncLoad.requestGameFlowCtrlActivefromLoad(0) OK"); }
-                            catch
-                            {
-                                try { almMO.Call("requestGameFlowCtrlActivefromLoad", (long)0); API.LogInfo("[COOP-GameSession] AsyncLoad flow ctrl OK (long)"); }
-                                catch { API.LogInfo("[COOP-GameSession] requestGameFlowCtrlActivefromLoad failed"); }
-                            }
-                        }
-                    }
-                    catch { }
-
-                    CoopState.StatusMessage = "Loading save slot " + (slot + 1) + "...";
-                    CoopState.SessionStarted = true;
-                    return;
-                }
-            }
-        }
-        catch (Exception e)
-        {
-            API.LogError("[COOP-GameSession] LoadSave error: " + e.Message);
-        }
-
-        CoopState.StatusMessage = "Load failed. Please load save manually from title screen.";
-        CoopState.SessionStarted = true;
+        UpdateLocalChapterCache();
+        return CoopState.LocalCurrentChapter;
     }
 
-    static void ContinueCurrentGame()
+    // =====================================================================
+    //  SESSION START (no auto new-game!)
+    // =====================================================================
+
+    /// <summary>
+    /// Called when the user clicked "Start Hosting" or a client successfully
+    /// connected. We do NOT try to change game state — we just flip our session
+    /// flag. The player's own interaction with RE7's title screen (New Game / Continue)
+    /// drives the real game-start flow.
+    /// </summary>
+    static void MarkSessionStarted()
     {
         CoopState.SessionStarted = true;
-        CoopState.StatusMessage = "Continuing current game.";
+
+        // Always kick off the starting-items flow. TryGiveStartingItems is
+        // idempotent (it flips StartingItemsGiven = true on success) and is
+        // gated by IsInventoryReady() so it won't crash if the scene is still
+        // loading. This covers BOTH cases:
+        //   - Hosting from the title screen: waits for Ethan to spawn.
+        //   - Hosting mid-game with Ethan already alive: injects knife/gun/ammo
+        //     once the inventory is stable.
+        CoopState.StartingItemsGiven = false;
+        CoopState.InventoryStableFrames = 0;
+
+        bool inGame = IsPlayerInGame();
+        CoopState.StatusMessage = inGame
+            ? "Co-op active in-game. Preparing starting items..."
+            : "Hosting! On the RE7 title screen, click 'New Game' or 'Continue'. Co-op activates automatically.";
+        API.LogInfo("[COOP-GameSession] MarkSessionStarted: starting-items flow enabled (in-game=" + inGame + ")");
     }
 
     // =====================================================================
     //  PUBLIC: GameManager access for other plugins
     // =====================================================================
 
-    /// <summary>
-    /// Check if currently in found footage mode.
-    /// Called by cutscene skipper.
-    /// </summary>
     public static bool IsFoundFootage()
     {
         if (_gameManager == null) return false;
-        try
-        {
-            return (bool)_gameManager.Call("isFoundFootage");
-        }
+        try { return (bool)_gameManager.Call("isFoundFootage"); }
         catch { return false; }
     }
 
-    /// <summary>
-    /// Exit found footage mode.
-    /// Called by cutscene skipper.
-    /// </summary>
     public static bool ExitFoundFootage()
     {
         if (_gameManager == null) return false;
@@ -455,16 +267,488 @@ public class ResidentCOOP_GameSession
         catch { return false; }
     }
 
-    /// <summary>
-    /// Check if scene is currently loading.
-    /// </summary>
     public static bool IsSceneLoading()
     {
         if (_gameManager == null) return false;
+        try { return (bool)_gameManager.Call("get_IsSceneLoading"); }
+        catch { return false; }
+    }
+
+    // =====================================================================
+    //  CHAPTER JUMP — Jump to a specific chapter via GameManager
+    //  (Used by the UI "Jump to Selected Chapter" button and by Force Sync to Host.)
+    // =====================================================================
+
+    // Real ChapterNo enum values from il2cpp dump (NOT sequential!)
+    // BootLogo=0, Chapter0=2, Chapter1=4, Chapter3=5, Chapter4=6,
+    // FF000-FF040=7-11, Chapter123=13, Chapter324=14, EndingMovie=17
+    static readonly int[] ALL_CHAPTER_ENUM_VALUES = { 0, 2, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 17 };
+
+    public static void PerformChapterJump(int chapterEnumValue)
+    {
+        if (_gameManager == null) return;
+
         try
         {
-            return (bool)_gameManager.Call("get_IsSceneLoading");
+            API.LogInfo("[COOP-GameSession] Performing chapter jump, ChapterNo enum = " + chapterEnumValue);
+
+            EnumerateChapterJumpKeys();
+
+            string jumpKey = null;
+            try
+            {
+                dynamic key = _gameManager.Call("getChapterJumpDataKey", chapterEnumValue);
+                if (key != null) jumpKey = key.ToString();
+            }
+            catch
+            {
+                try
+                {
+                    dynamic key = _gameManager.Call("getChapterJumpDataKey", (long)chapterEnumValue);
+                    if (key != null) jumpKey = key.ToString();
+                }
+                catch { }
+            }
+
+            if (!string.IsNullOrEmpty(jumpKey))
+            {
+                API.LogInfo("[COOP-GameSession] Got jump key: '" + jumpKey + "' for enum value " + chapterEnumValue);
+
+                var jumpKeyStr = REFrameworkNET.VM.CreateString(jumpKey);
+                var emptyStr = REFrameworkNET.VM.CreateString("");
+                _gameManager.Call("chapterJumpRequest", jumpKeyStr, false, emptyStr);
+                CoopState.StatusMessage = "Jumping to chapter (key=" + jumpKey + ")...";
+                CoopState.StartingItemsGiven = false;
+                API.LogInfo("[COOP-GameSession] chapterJumpRequest called successfully!");
+                return;
+            }
+
+            API.LogWarning("[COOP-GameSession] No jump key for enum " + chapterEnumValue);
+            CoopState.StatusMessage = "Chapter jump: key lookup failed for " + chapterEnumValue;
         }
-        catch { return false; }
+        catch (Exception e)
+        {
+            API.LogError("[COOP-GameSession] ChapterJump failed: " + e.Message);
+            CoopState.StatusMessage = "Chapter jump failed: " + e.Message;
+        }
+    }
+
+    static bool _keysEnumerated = false;
+
+    static void EnumerateChapterJumpKeys()
+    {
+        if (_keysEnumerated) return;
+        _keysEnumerated = true;
+
+        try
+        {
+            API.LogInfo("[COOP-GameSession] === Enumerating chapter jump keys (using real enum values) ===");
+
+            foreach (int enumVal in ALL_CHAPTER_ENUM_VALUES)
+            {
+                try
+                {
+                    dynamic key = _gameManager.Call("getChapterJumpDataKey", enumVal);
+                    if (key != null)
+                    {
+                        string keyStr = key.ToString();
+                        if (!string.IsNullOrEmpty(keyStr))
+                            API.LogInfo("[COOP-GameSession]   ChapterNo(" + enumVal + ") -> key: '" + keyStr + "'");
+                    }
+                }
+                catch { }
+            }
+
+            int[] dlcValues = { 20, 21, 22, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37 };
+            foreach (int v in dlcValues)
+            {
+                try
+                {
+                    dynamic key = _gameManager.Call("getChapterJumpDataKey", v);
+                    if (key != null)
+                    {
+                        string keyStr = key.ToString();
+                        if (!string.IsNullOrEmpty(keyStr))
+                            API.LogInfo("[COOP-GameSession]   ChapterNo(" + v + ") -> key: '" + keyStr + "'");
+                    }
+                }
+                catch { }
+            }
+
+            API.LogInfo("[COOP-GameSession] === End chapter jump key enumeration ===");
+        }
+        catch (Exception e)
+        {
+            API.LogError("[COOP-GameSession] EnumerateKeys error: " + e.Message);
+        }
+    }
+
+    // =====================================================================
+    //  STARTING ITEMS — Give knife + pistol + 15 bullets when first spawning.
+    //  From il2cpp dump:
+    //    app.ItemManager.createItemInstance(via.GameObject owner, string itemDataID) -> via.GameObject
+    //    app.ItemManager.createDropItemInstance(via.GameObject owner, string itemDataID, int setStackNum) -> via.GameObject
+    //    app.Inventory.AddList(via.GameObject obj, bool isDrawOff) -> void
+    //    app.Inventory is a COMPONENT on the player GameObject
+    // =====================================================================
+
+    // REAL item IDs confirmed from in-game get_ItemDataIDNames dump (see items.txt).
+    static readonly string[] HANDGUN_IDS = { "Handgun_G17", "Handgun_M19", "Handgun_MPM" };
+    static readonly string[] BULLET_IDS  = { "HandgunBullet", "HandgunBulletL" };
+    static readonly string[] KNIFE_IDS   = { "Knife", "KitchenKnife", "CKnife" };
+
+    static int _itemGiveRetryFrames = 0;
+    static bool _itemIDsDumped = false;
+
+    // Cache of discovered 'app.Item' stack-count setter (name + kind)
+    static string _appItemStackMember = null;   // property/method/field name
+    static int _appItemStackKind = 0;           // 0=none, 1=method(set_StackNum style), 2=field
+    static bool _appItemIntrospected = false;
+
+    /// <summary>
+    /// Guard: only return true when the inventory is safe to poke. The crash stack we saw
+    /// (`app.CH9ItemFlashLight.doAwake -> EnvActivateManager.folderActivate -> createDropItemInstance`)
+    /// means we were calling item-creation while the scene was still being activated.
+    /// </summary>
+    static bool IsInventoryReady(ManagedObject playerGO, ManagedObject invMO)
+    {
+        try
+        {
+            // 1) Scene must not be loading
+            if (_gameManager != null)
+            {
+                try
+                {
+                    bool loading = (bool)_gameManager.Call("get_IsSceneLoading");
+                    if (loading) { CoopState.InventoryStableFrames = 0; return false; }
+                }
+                catch { }
+            }
+
+            // 2) Player transform must have a real position (not origin 0,0,0)
+            try
+            {
+                dynamic tf = playerGO.Call("get_Transform");
+                if (tf == null) { CoopState.InventoryStableFrames = 0; return false; }
+
+                var typed = ((tf as ManagedObject) as IObject).As<via.Transform>();
+                if (typed != null)
+                {
+                    var p = typed.Position;
+                    float magSq = p.x * p.x + p.y * p.y + p.z * p.z;
+                    if (magSq < 0.0001f) { CoopState.InventoryStableFrames = 0; return false; }
+                }
+            }
+            catch { /* tolerate */ }
+
+            // 3) Inventory component is present
+            if (invMO == null) { CoopState.InventoryStableFrames = 0; return false; }
+
+            // 4) Cooldown: require N consecutive good frames so folderActivate can finish.
+            CoopState.InventoryStableFrames++;
+            if (CoopState.InventoryStableFrames < CoopState.RequiredStableFrames)
+            {
+                if (CoopState.InventoryStableFrames % 60 == 0)
+                    API.LogInfo("[COOP-Items] Waiting for inventory to stabilize... "
+                        + CoopState.InventoryStableFrames + "/" + CoopState.RequiredStableFrames);
+                return false;
+            }
+
+            return true;
+        }
+        catch
+        {
+            CoopState.InventoryStableFrames = 0;
+            return false;
+        }
+    }
+
+    static void IntrospectAppItemOnce(TDB tdb)
+    {
+        if (_appItemIntrospected) return;
+        _appItemIntrospected = true;
+
+        try
+        {
+            TypeDefinition appItemType = tdb.FindType("app.Item");
+            if (appItemType == null) return;
+
+            var methods = appItemType.GetMethods();
+            if (methods != null)
+            {
+                for (int i = 0; i < methods.Count; i++)
+                {
+                    string n = methods[i].GetName();
+                    string l = n.ToLower();
+                    if (l == "set_stacknum" || l == "setstacknum" || l == "set_count"
+                        || l == "setstackcount" || l == "set_itemnum" || l == "setitemnum")
+                    {
+                        _appItemStackMember = n;
+                        _appItemStackKind = 1;
+                        API.LogInfo("[COOP-Items] app.Item stack setter found (method): " + n);
+                        return;
+                    }
+                }
+            }
+
+            var fields = appItemType.GetFields();
+            if (fields != null)
+            {
+                for (int i = 0; i < fields.Count; i++)
+                {
+                    string n = fields[i].GetName();
+                    string l = n.ToLower();
+                    if (l == "_stacknum" || l == "stacknum" || l == "_count"
+                        || l == "_itemnum" || l == "itemnum")
+                    {
+                        _appItemStackMember = n;
+                        _appItemStackKind = 2;
+                        API.LogInfo("[COOP-Items] app.Item stack setter found (field): " + n);
+                        return;
+                    }
+                }
+            }
+
+            API.LogInfo("[COOP-Items] app.Item: no stack setter discovered — will rely on createDropItemInstance fallback for counts > 1");
+        }
+        catch (Exception e)
+        {
+            API.LogWarning("[COOP-Items] IntrospectAppItem error: " + e.Message);
+        }
+    }
+
+    static bool TryCreateAndAddItem(string[] ids, int count, string label,
+        ManagedObject playerGO, ManagedObject invMO, ManagedObject imMO, TypeDefinition invType, TDB tdb)
+    {
+        foreach (string id in ids)
+        {
+            try
+            {
+                var idStr = REFrameworkNET.VM.CreateString(id);
+                ManagedObject itemGOMO = null;
+
+                // Attempt 1: createItemInstance (safer — no shell/DoomsBehavior)
+                try
+                {
+                    dynamic itemGO = imMO.Call("createItemInstance", playerGO, idStr);
+                    if (itemGO != null)
+                    {
+                        itemGOMO = itemGO as ManagedObject;
+
+                        // Apply stack count if needed
+                        if (count > 1 && _appItemStackMember != null)
+                        {
+                            try
+                            {
+                                TypeDefinition appItemType = tdb.FindType("app.Item");
+                                object appItemRt = appItemType.GetRuntimeType();
+                                dynamic itemComp = itemGOMO.Call("getComponent(System.Type)", appItemRt);
+                                if (itemComp != null)
+                                {
+                                    ManagedObject ic = itemComp as ManagedObject;
+                                    if (_appItemStackKind == 1)
+                                    {
+                                        try { ic.Call(_appItemStackMember, count); }
+                                        catch { try { ic.Call(_appItemStackMember, (long)count); } catch { } }
+                                    }
+                                    else if (_appItemStackKind == 2)
+                                    {
+                                        try { ic.SetField(_appItemStackMember, count); } catch { }
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch (Exception ci)
+                {
+                    if (CoopState.FrameCount % 300 == 0)
+                        API.LogInfo("[COOP-Items] " + label + " '" + id + "' createItemInstance: " + ci.Message);
+                }
+
+                // Attempt 2 (fallback): createDropItemInstance for counts > 1 if no stack setter
+                if (itemGOMO == null && count > 1 && _appItemStackMember == null)
+                {
+                    try
+                    {
+                        dynamic dropGO = imMO.Call("createDropItemInstance", playerGO, idStr, count);
+                        if (dropGO != null) itemGOMO = dropGO as ManagedObject;
+                    }
+                    catch (Exception di)
+                    {
+                        if (CoopState.FrameCount % 300 == 0)
+                            API.LogInfo("[COOP-Items] " + label + " '" + id + "' createDropItemInstance: " + di.Message);
+                    }
+                }
+
+                if (itemGOMO == null) continue;
+
+                // Add to inventory
+                try
+                {
+                    invMO.Call("AddList", itemGOMO, false);
+                    API.LogInfo("[COOP-Items] " + label + " '" + id + "' x" + count + " added via AddList!");
+                    return true;
+                }
+                catch (Exception addEx)
+                {
+                    API.LogWarning("[COOP-Items] AddList failed for " + label + " '" + id + "': " + addEx.Message);
+                    try
+                    {
+                        TypeDefinition appItemType = tdb.FindType("app.Item");
+                        object appItemRt = appItemType.GetRuntimeType();
+                        dynamic itemComp = itemGOMO.Call("getComponent(System.Type)", appItemRt);
+                        if (itemComp != null)
+                        {
+                            Method addItemMethod = invType.GetMethod("addItem");
+                            if (addItemMethod != null)
+                            {
+                                addItemMethod.Invoke(invMO, new object[] { itemComp, null });
+                                API.LogInfo("[COOP-Items] " + label + " '" + id + "' added via addItem fallback!");
+                                return true;
+                            }
+                        }
+                    }
+                    catch (Exception ex2)
+                    {
+                        API.LogWarning("[COOP-Items] addItem fallback for " + label + ": " + ex2.Message);
+                    }
+                }
+            }
+            catch (Exception outer)
+            {
+                if (CoopState.FrameCount % 300 == 0)
+                    API.LogInfo("[COOP-Items] " + label + " '" + id + "' failed: " + outer.Message);
+            }
+        }
+
+        return false;
+    }
+
+    static void TryGiveStartingItems()
+    {
+        if (_itemGiveRetryFrames > 0) { _itemGiveRetryFrames--; return; }
+        _itemGiveRetryFrames = 120;
+
+        try
+        {
+            // Get the player GameObject
+            dynamic objMgr = API.GetManagedSingleton("app.ObjectManager");
+            if (objMgr == null) { return; }
+
+            dynamic playerObj = (objMgr as ManagedObject).GetField("PlayerObj");
+            if (playerObj == null)
+            {
+                // Player not spawned yet — reset stability counter but don't spam logs.
+                CoopState.InventoryStableFrames = 0;
+                return;
+            }
+
+            ManagedObject playerGO = playerObj as ManagedObject;
+
+            TDB tdb = API.GetTDB();
+            TypeDefinition invType = tdb.FindType("app.Inventory");
+            if (invType == null) { API.LogWarning("[COOP-Items] app.Inventory not in TDB"); return; }
+
+            object invRt = invType.GetRuntimeType();
+            if (invRt == null) return;
+
+            dynamic inventoryComp = playerGO.Call("getComponent(System.Type)", invRt);
+            if (inventoryComp == null)
+            {
+                if (CoopState.FrameCount % 300 == 0)
+                    API.LogInfo("[COOP-Items] Player has no Inventory yet, retrying...");
+                CoopState.InventoryStableFrames = 0;
+                return;
+            }
+            ManagedObject invMO = inventoryComp as ManagedObject;
+
+            dynamic itemMgr = API.GetManagedSingleton("app.ItemManager");
+            if (itemMgr == null) { return; }
+            ManagedObject imMO = itemMgr as ManagedObject;
+
+            if (!_itemIDsDumped)
+            {
+                _itemIDsDumped = true;
+                DumpItemDataIDs(imMO);
+            }
+
+            IntrospectAppItemOnce(tdb);
+
+            // GUARD: bail out until the inventory is really ready — avoids the
+            // access-violation crash inside createDropItemInstance during scene activation.
+            if (!IsInventoryReady(playerGO, invMO))
+            {
+                _itemGiveRetryFrames = 30;
+                return;
+            }
+
+            API.LogInfo("[COOP-Items] Inventory ready. Creating starting items (Knife + Handgun + Ammo)...");
+
+            bool knifeOk = TryCreateAndAddItem(KNIFE_IDS,   1,  "Knife",   playerGO, invMO, imMO, invType, tdb);
+            bool gunOk   = TryCreateAndAddItem(HANDGUN_IDS, 1,  "Handgun", playerGO, invMO, imMO, invType, tdb);
+            bool ammoOk  = TryCreateAndAddItem(BULLET_IDS,  15, "Bullets", playerGO, invMO, imMO, invType, tdb);
+
+            if (knifeOk || gunOk || ammoOk)
+            {
+                CoopState.StartingItemsGiven = true;
+                CoopState.StatusMessage = "Starting items: Knife=" + knifeOk + " Gun=" + gunOk + " Ammo=" + ammoOk;
+                API.LogInfo("[COOP-Items] Items given! Knife=" + knifeOk + " Gun=" + gunOk + " Ammo=" + ammoOk);
+            }
+            else
+            {
+                API.LogInfo("[COOP-Items] No items could be created/added yet, will retry...");
+            }
+        }
+        catch (Exception e)
+        {
+            if (CoopState.FrameCount % 300 == 0)
+                API.LogError("[COOP-Items] TryGiveStartingItems: " + e.Message);
+        }
+    }
+
+    static void DumpItemDataIDs(ManagedObject itemMgrMO)
+    {
+        try
+        {
+            dynamic itemNames = itemMgrMO.Call("get_ItemDataIDNames");
+            if (itemNames == null) return;
+
+            ManagedObject namesList = itemNames as ManagedObject;
+            int count = 0;
+            try { count = (int)namesList.Call("get_Count"); } catch { }
+
+            API.LogInfo("[COOP-Items] === ItemDataIDs (" + count + " total) ===");
+
+            for (int i = 0; i < count; i++)
+            {
+                try
+                {
+                    dynamic name = namesList.Call("get_Item", i);
+                    if (name != null)
+                    {
+                        string n = name.ToString();
+                        if (n.ToLower().Contains("gun") || n.ToLower().Contains("bullet") ||
+                            n.ToLower().Contains("weapon") || n.ToLower().Contains("ammo") ||
+                            n.ToLower().Contains("handgun") || n.ToLower().Contains("pistol") ||
+                            n.ToLower().Contains("wp") || n.ToLower().Contains("knife"))
+                        {
+                            API.LogInfo("[COOP-Items]   >>> [" + i + "] " + n + " <<<");
+                        }
+                        else
+                        {
+                            API.LogInfo("[COOP-Items]   [" + i + "] " + n);
+                        }
+                    }
+                }
+                catch { }
+            }
+            API.LogInfo("[COOP-Items] === End ItemDataIDs ===");
+        }
+        catch (Exception e)
+        {
+            API.LogWarning("[COOP-Items] DumpItemDataIDs error: " + e.Message);
+        }
     }
 }

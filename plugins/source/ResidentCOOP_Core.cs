@@ -140,6 +140,17 @@ public class ResidentCOOP_Core
                 }
             }
 
+            // Check teleport-to-host request (post-cutscene)
+            if (CoopState.IsHost && CoopState.TeleportToHostRequested)
+            {
+                CoopState.TeleportToHostRequested = false;
+                SendRaw(NetProtocol.WriteTeleportSync(
+                    CoopState.LocalPlayer.PosX,
+                    CoopState.LocalPlayer.PosY,
+                    CoopState.LocalPlayer.PosZ));
+                API.LogInfo("[COOP] Sent teleport sync to client");
+            }
+
             // Update interpolation for remote player
             UpdateInterpolation();
         }
@@ -223,7 +234,7 @@ public class ResidentCOOP_Core
         if (_client != null) { _client.Dispose(); _client = null; }
     }
 
-    static bool SendRaw(byte[] data)
+    public static bool SendRaw(byte[] data)
     {
         if (CoopState.IsHost && _server != null)
             return _server.Send(data);
@@ -307,6 +318,15 @@ public class ResidentCOOP_Core
             case MessageType.RewardUnlock:
                 HandleRewardUnlock(msg.Payload);
                 break;
+            case MessageType.TeleportSync:
+                HandleTeleportSync(msg.Payload);
+                break;
+            case MessageType.GameOver:
+                HandleGameOver(msg.Payload);
+                break;
+            case MessageType.GameEvent:
+                HandleGameEventMsg(msg.Payload);
+                break;
         }
     }
 
@@ -320,7 +340,7 @@ public class ResidentCOOP_Core
 
         if (version != NetProtocol.PROTOCOL_VERSION)
         {
-            _server.Send(NetProtocol.WriteHandshakeAck(false, "Version mismatch"));
+            _server.Send(NetProtocol.WriteHandshakeAck(false, "Version mismatch", -1));
             return;
         }
 
@@ -329,8 +349,27 @@ public class ResidentCOOP_Core
         CoopState.CurrentScreen = UIScreen.Connected;
         CoopState.StatusMessage = clientName + " joined the game!";
         CoopState.LastPongReceivedTicks = DateTime.UtcNow.Ticks;
-        _server.Send(NetProtocol.WriteHandshakeAck(true, CoopState.PlayerName));
-        API.LogInfo("[COOP] Client joined: " + clientName);
+
+        // Read the host's current ChapterNo enum value so the client can detect a mismatch.
+        // NOTE: REFramework compiles each plugin .cs individually — we CANNOT reference
+        // ResidentCOOP_GameSession directly here. Use CallPluginGet (reflection) instead.
+        int hostChapter = -1;
+        try
+        {
+            object r = CallPluginGet("ResidentCOOP_GameSession", "GetCurrentChapter", new object[0]);
+            if (r != null) hostChapter = (int)r;
+        }
+        catch { }
+        CoopState.HostCurrentChapter = hostChapter;
+
+
+        _server.Send(NetProtocol.WriteHandshakeAck(true, CoopState.PlayerName, hostChapter));
+        API.LogInfo("[COOP] Client joined: " + clientName + " (reporting hostChapter=" + hostChapter + ")");
+
+        // Send current position immediately so client can teleport to host
+        // The host's position is already in CoopState.LocalPlayer
+        SendPlayerState();
+        API.LogInfo("[COOP] Sent initial position for late-join teleport");
     }
 
     static void HandleHandshakeAck(byte[] payload)
@@ -339,7 +378,8 @@ public class ResidentCOOP_Core
 
         bool accepted;
         string hostName;
-        NetProtocol.ReadHandshakeAck(payload, out accepted, out hostName);
+        int hostChapter;
+        NetProtocol.ReadHandshakeAck(payload, out accepted, out hostName, out hostChapter);
 
         if (accepted)
         {
@@ -348,8 +388,46 @@ public class ResidentCOOP_Core
             CoopState.CurrentScreen = UIScreen.Connected;
             CoopState.StatusMessage = "Connected to " + hostName + "!";
             CoopState.LastPongReceivedTicks = DateTime.UtcNow.Ticks;
-            API.LogInfo("[COOP] Connected to host: " + hostName);
+            CoopState.TeleportToHostRequested = true; // Late-join: teleport to host position
+
+            // --- Late-join session sync ---
+            // The host is already in-game (otherwise it wouldn't have accepted us). Mark our
+            // local session as started and force the starting-items flow to run so the client
+            // ALSO receives knife + handgun + ammo. GameSession.IsInventoryReady() will gate
+            // actual creation until our local inventory is safe to touch.
+            CoopState.SessionStarted = true;
+            CoopState.StartingItemsGiven = false;
+            CoopState.InventoryStableFrames = 0;
+
+            // --- Chapter mismatch detection ---
+            // Compare the host's reported chapter with our own. If they differ, flag it so
+            // the UI can offer a "Force Sync to Host" button.
+            CoopState.HostCurrentChapter = hostChapter;
+            int myChapter = -1;
+            try
+            {
+                object r = CallPluginGet("ResidentCOOP_GameSession", "GetCurrentChapter", new object[0]);
+                if (r != null) myChapter = (int)r;
+            }
+            catch { }
+            CoopState.LocalCurrentChapter = myChapter;
+
+
+            if (hostChapter >= 0 && myChapter >= 0 && hostChapter != myChapter)
+            {
+                CoopState.ChapterMismatch = true;
+                API.LogWarning("[COOP] Chapter mismatch: host=" + hostChapter + " local=" + myChapter);
+                CoopState.StatusMessage = "WARNING: Host is on a different chapter!";
+            }
+            else
+            {
+                CoopState.ChapterMismatch = false;
+            }
+
+            API.LogInfo("[COOP] Connected to host: " + hostName
+                + " (hostChapter=" + hostChapter + " localChapter=" + myChapter + ")");
         }
+
         else
         {
             CoopState.ErrorMessage = "Rejected: " + hostName;
@@ -357,6 +435,7 @@ public class ResidentCOOP_Core
             Disconnect();
         }
     }
+
 
     static void HandleRemotePlayerState(byte[] payload)
     {
@@ -519,7 +598,72 @@ public class ResidentCOOP_Core
         string rewardID = NetProtocol.ReadRewardUnlock(payload);
         _pendingRewardUnlock = rewardID;
         API.LogInfo("[COOP] Reward unlock received: " + rewardID);
+
+        // Delegate to InventorySync via reflection
+        try { CallPlugin("ResidentCOOP_InventorySync", "QueueRewardUnlock", new object[] { rewardID }); } catch { }
     }
+
+    /// <summary>
+    /// Handle incoming GameEvent messages — delegate to WorldSync.
+    /// These carry item pickups, door changes, objectives, map flags.
+    /// </summary>
+    static void HandleGameEventMsg(byte[] payload)
+    {
+        try { CallPlugin("ResidentCOOP_WorldSync", "HandleIncomingGameEvent", new object[] { payload }); }
+        catch (Exception e)
+        {
+            API.LogError("[COOP] GameEvent handler error: " + e.Message);
+        }
+    }
+
+    /// <summary>
+    /// Reflection helper: call a static method on another plugin class.
+    /// REFramework compiles each .cs individually, so no direct cross-refs.
+    /// </summary>
+    static System.Collections.Generic.Dictionary<string, Type> _pluginTypeCache =
+        new System.Collections.Generic.Dictionary<string, Type>();
+
+    static void CallPlugin(string typeName, string methodName, object[] args)
+    {
+        Type t;
+        if (!_pluginTypeCache.TryGetValue(typeName, out t) || t == null)
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try { t = asm.GetType(typeName); if (t != null) break; } catch { }
+            }
+            _pluginTypeCache[typeName] = t;
+        }
+        if (t == null) return;
+
+        var method = t.GetMethod(methodName,
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+        if (method != null) method.Invoke(null, args);
+    }
+
+    /// <summary>
+    /// Reflection helper: call a static method on another plugin class and return its result.
+    /// Returns null if the type/method is not found.
+    /// </summary>
+    static object CallPluginGet(string typeName, string methodName, object[] args)
+    {
+        Type t;
+        if (!_pluginTypeCache.TryGetValue(typeName, out t) || t == null)
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try { t = asm.GetType(typeName); if (t != null) break; } catch { }
+            }
+            _pluginTypeCache[typeName] = t;
+        }
+        if (t == null) return null;
+
+        var method = t.GetMethod(methodName,
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+        if (method == null) return null;
+        return method.Invoke(null, args);
+    }
+
 
     /// <summary>
     /// Public: get and clear pending weapon share.
@@ -584,11 +728,12 @@ public class ResidentCOOP_Core
         CoopState.RemotePlayer.PosY = a.PosY + (b.PosY - a.PosY) * it;
         CoopState.RemotePlayer.PosZ = a.PosZ + (b.PosZ - a.PosZ) * it;
 
-        // For rotation, use latest (slerp is complex for minimal benefit here)
-        CoopState.RemotePlayer.RotX = b.RotX;
-        CoopState.RemotePlayer.RotY = b.RotY;
-        CoopState.RemotePlayer.RotZ = b.RotZ;
-        CoopState.RemotePlayer.RotW = b.RotW;
+        // Rotation: quaternion SLERP for smooth interpolation
+        Slerp(a.RotX, a.RotY, a.RotZ, a.RotW,
+              b.RotX, b.RotY, b.RotZ, b.RotW,
+              it,
+              out CoopState.RemotePlayer.RotX, out CoopState.RemotePlayer.RotY,
+              out CoopState.RemotePlayer.RotZ, out CoopState.RemotePlayer.RotW);
 
         // Other fields use latest
         CoopState.RemotePlayer.Health = b.Health;
@@ -596,5 +741,124 @@ public class ResidentCOOP_Core
         CoopState.RemotePlayer.AnimState = b.AnimState;
         CoopState.RemotePlayer.WeaponID = b.WeaponID;
         CoopState.RemotePlayer.Flags = b.Flags;
+    }
+
+    /// <summary>
+    /// Quaternion SLERP for smooth rotation interpolation.
+    /// Manual implementation since System.Numerics.Quaternion may not be available.
+    /// </summary>
+    static void Slerp(float ax, float ay, float az, float aw,
+                       float bx, float by, float bz, float bw,
+                       float t,
+                       out float rx, out float ry, out float rz, out float rw)
+    {
+        // Compute dot product
+        float dot = ax * bx + ay * by + az * bz + aw * bw;
+
+        // If negative dot, negate one quaternion to take shorter path
+        if (dot < 0f)
+        {
+            bx = -bx; by = -by; bz = -bz; bw = -bw;
+            dot = -dot;
+        }
+
+        float s0, s1;
+        if (dot > 0.9995f)
+        {
+            // Very close — use linear interpolation to avoid division by zero
+            s0 = 1f - t;
+            s1 = t;
+        }
+        else
+        {
+            float theta = (float)Math.Acos(dot);
+            float sinTheta = (float)Math.Sin(theta);
+            s0 = (float)Math.Sin((1f - t) * theta) / sinTheta;
+            s1 = (float)Math.Sin(t * theta) / sinTheta;
+        }
+
+        rx = s0 * ax + s1 * bx;
+        ry = s0 * ay + s1 * by;
+        rz = s0 * az + s1 * bz;
+        rw = s0 * aw + s1 * bw;
+    }
+
+    // --- Teleport sync handling ---
+
+    static void HandleTeleportSync(byte[] payload)
+    {
+        if (!CoopState.IsClient) return;
+
+        float x, y, z;
+        NetProtocol.ReadTeleportSync(payload, out x, out y, out z);
+        API.LogInfo("[COOP] Teleport sync received: " + x + ", " + y + ", " + z);
+
+        // Store for the Cutscene plugin to apply
+        CoopState.RemotePlayer.PosX = x;
+        CoopState.RemotePlayer.PosY = y;
+        CoopState.RemotePlayer.PosZ = z;
+
+        // Apply teleport via ObjectManager
+        try
+        {
+            dynamic objectManager = API.GetManagedSingleton("app.ObjectManager");
+            if (objectManager == null) return;
+
+            dynamic player = (objectManager as ManagedObject).Call("getPlayer");
+            if (player == null) return;
+
+            dynamic transform = (player as ManagedObject).Call("get_Transform");
+            if (transform == null) return;
+
+            ManagedObject transformMO = transform as ManagedObject;
+            if (transformMO == null) return;
+
+            var typed = (transformMO as IObject).As<via.Transform>();
+            if (typed != null)
+            {
+                var pos = typed.Position;
+                pos.x = x; pos.y = y; pos.z = z;
+                typed.Position = pos;
+                API.LogInfo("[COOP] Client teleported to host position");
+            }
+        }
+        catch (Exception e)
+        {
+            API.LogError("[COOP] Teleport apply failed: " + e.Message);
+        }
+    }
+
+    static void HandleGameOver(byte[] payload)
+    {
+        API.LogInfo("[COOP] Shared Game Over received from partner!");
+        CoopState.SharedGameOverTriggered = true;
+
+        // Trigger game over on the local player
+        try
+        {
+            dynamic gameManager = API.GetManagedSingleton("app.GameManager");
+            if (gameManager != null)
+            {
+                // Try to trigger game over via GameManager
+                try { (gameManager as ManagedObject).Call("gameOverCaptureStart"); }
+                catch { }
+            }
+        }
+        catch (Exception e)
+        {
+            API.LogError("[COOP] GameOver trigger failed: " + e.Message);
+        }
+    }
+
+    /// <summary>
+    /// Public: send game over notification to partner.
+    /// Called by PlayerSync when local player dies.
+    /// </summary>
+    public static void BroadcastGameOver()
+    {
+        if (!CoopState.IsCoopActive) return;
+        if (CoopState.SharedGameOverTriggered) return; // Don't echo back
+        SendRaw(NetProtocol.WriteGameOver());
+        API.LogInfo("[COOP] Sent shared game over to partner");
     }
 }

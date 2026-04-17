@@ -22,7 +22,9 @@ namespace ResidentCOOP.Shared
         SceneUnload  = 0x0C,  // Host tells client to unload a scene
         DamageEvent  = 0x0D,  // Damage dealt to an entity (bidirectional)
         WeaponShare  = 0x0E,  // Weapon acquired - share to partner if space
-        RewardUnlock = 0x0F   // Reward unlocked - sync to partner
+        RewardUnlock = 0x0F,  // Reward unlocked - sync to partner
+        TeleportSync = 0x10,  // Post-cutscene: teleport to this position
+        GameOver     = 0x11   // Shared game over: one dies, all die
     }
 
     public static class NetProtocol
@@ -69,26 +71,42 @@ namespace ResidentCOOP.Shared
         }
 
         // --- HandshakeAck (Host -> Client) ---
+        // Payload layout (v2, backward compatible via length check):
+        //   accepted : bool
+        //   hostName : string
+        //   hostChapter : int32   (NEW - host's ChapterNo enum value; -1 if unknown)
 
-        public static byte[] WriteHandshakeAck(bool accepted, string hostName)
+        public static byte[] WriteHandshakeAck(bool accepted, string hostName, int hostChapter = -1)
         {
             MemoryStream ms = new MemoryStream();
             BinaryWriter bw = new BinaryWriter(ms);
             bw.Write(accepted);
             bw.Write(hostName ?? "Host");
+            bw.Write(hostChapter);
             byte[] result = Frame(MessageType.HandshakeAck, ms.ToArray());
             bw.Close(); ms.Close();
             return result;
         }
 
-        public static void ReadHandshakeAck(byte[] payload, out bool accepted, out string hostName)
+        public static void ReadHandshakeAck(byte[] payload, out bool accepted, out string hostName, out int hostChapter)
         {
             MemoryStream ms = new MemoryStream(payload);
             BinaryReader br = new BinaryReader(ms);
             accepted = br.ReadBoolean();
             hostName = br.ReadString();
+            // Older peers won't include the chapter field; keep reading defensively.
+            hostChapter = -1;
+            try { if (ms.Position < ms.Length) hostChapter = br.ReadInt32(); } catch { }
             br.Close(); ms.Close();
         }
+
+        // Legacy 2-out overload, preserved so other call-sites keep compiling.
+        public static void ReadHandshakeAck(byte[] payload, out bool accepted, out string hostName)
+        {
+            int _dummyChapter;
+            ReadHandshakeAck(payload, out accepted, out hostName, out _dummyChapter);
+        }
+
 
         // --- PlayerState (Bidirectional) ---
 
@@ -338,6 +356,35 @@ namespace ResidentCOOP.Shared
             string id = br.ReadString();
             br.Close(); ms.Close();
             return id;
+        }
+
+        // --- TeleportSync (Host -> Client) ---
+        // Host sends their position after a cutscene ends so client teleports to them.
+
+        public static byte[] WriteTeleportSync(float x, float y, float z)
+        {
+            MemoryStream ms = new MemoryStream(12);
+            BinaryWriter bw = new BinaryWriter(ms);
+            bw.Write(x); bw.Write(y); bw.Write(z);
+            byte[] result = Frame(MessageType.TeleportSync, ms.ToArray());
+            bw.Close(); ms.Close();
+            return result;
+        }
+
+        public static void ReadTeleportSync(byte[] payload, out float x, out float y, out float z)
+        {
+            MemoryStream ms = new MemoryStream(payload);
+            BinaryReader br = new BinaryReader(ms);
+            x = br.ReadSingle(); y = br.ReadSingle(); z = br.ReadSingle();
+            br.Close(); ms.Close();
+        }
+
+        // --- GameOver (Bidirectional) ---
+        // When one player dies, notify the other to trigger game over.
+
+        public static byte[] WriteGameOver()
+        {
+            return Frame(MessageType.GameOver, new byte[0]);
         }
     }
 }

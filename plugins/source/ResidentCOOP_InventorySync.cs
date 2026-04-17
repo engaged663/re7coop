@@ -1,20 +1,20 @@
 // ResidentCOOP_InventorySync.cs
-// Inventory synchronization with weapon sharing rules:
+// Shared inventory synchronization.
 //
-// RULES:
-//   - Normal items (herbs, ammo, keys, etc.): NOT shared
-//   - Weapons: SHARED to partner IF partner has inventory space
-//   - If partner inventory is full: weapon is NOT shared (no forced drop)
-//   - Rewards: Unlock synced to both players
+// MODE: SHARED INVENTORY
+//   - ALL items (herbs, ammo, keys, weapons, everything) are shared.
+//   - When either player picks up anything, BOTH players get it.
+//   - This is achieved via WorldSync broadcasting setItemGotFlag.
+//   - This plugin handles the weapon EQUIP sync and reward system.
 //
 // Systems used:
-//   app.ItemManager        - item creation, weapon detection
-//   app.InventorySystem    - get active player inventory
-//   app.InventoryManager   - inventory state, slot checks
-//   app.RewardManager      - reward unlock sync
-//   app.Inventory          - component on player for direct inventory access
+//   app.ItemManager        — item queries, weapon detection
+//   app.InventoryManager   — inventory state
+//   app.RewardManager      — reward unlock sync
+//   app.EquipManager       — weapon equip state
 
 using System;
+using System.Collections.Generic;
 using REFrameworkNET;
 using REFrameworkNET.Attributes;
 using REFrameworkNET.Callbacks;
@@ -24,24 +24,26 @@ using ResidentCOOP.Shared;
 public class ResidentCOOP_InventorySync
 {
     static ManagedObject _itemMgr = null;
-    static ManagedObject _inventorySys = null;
-    static ManagedObject _inventoryMgr = null;
     static ManagedObject _rewardMgr = null;
+    static ManagedObject _equipMgr = null;
     static bool _singletonsReady = false;
-    static bool _hooksDone = false;
 
-    // Track which weapons we've already shared (avoid duplicate sends)
-    static System.Collections.Generic.HashSet<string> _sharedWeapons =
-        new System.Collections.Generic.HashSet<string>();
+    // Pending weapon shares/rewards from network
+    static string _pendingWeapon = null;
+    static string _pendingReward = null;
+    static readonly object _pendingLock = new object();
+
+    // Track which rewards we've already sent to avoid duplicates
+    static HashSet<string> _sentRewards = new HashSet<string>();
 
     [PluginEntryPoint]
     public static void Main()
     {
         try
         {
-            SetupWeaponDetectionHooks();
             SetupRewardHooks();
-            API.LogInfo("[COOP-InvSync] Loaded. Weapons shared, items private.");
+            SetupEquipHooks();
+            API.LogInfo("[COOP-InvSync] Loaded. SHARED inventory mode.");
         }
         catch (Exception e)
         {
@@ -61,97 +63,57 @@ public class ResidentCOOP_InventorySync
         _singletonsReady = true;
 
         _itemMgr = GetSingleton("app.ItemManager");
-        _inventorySys = GetSingleton("app.InventorySystem");
-        _inventoryMgr = GetSingleton("app.InventoryManager");
         _rewardMgr = GetSingleton("app.RewardManager");
+        _equipMgr = GetSingleton("app.EquipManager");
     }
 
     // =====================================================================
-    //  WEAPON DETECTION - Hook item pickup to detect weapons
-    //
-    //  When a player picks up a weapon (via ItemManager.setItemGotFlag or
-    //  ItemManager.createItemInstance), we check if it's a weapon type.
-    //  RE7 weapon IDs typically contain "wp" or "Weapon" patterns.
-    //  We also check via ItemManager.getBulletNum - if an item has bullet
-    //  data, it's likely a weapon.
+    //  EQUIP SYNC — Track weapon equip changes to show on ghost player
+    //  The PlayerStateData.WeaponID is set here based on current equip.
     // =====================================================================
 
-    static void SetupWeaponDetectionHooks()
+    static void SetupEquipHooks()
     {
         TDB tdb = API.GetTDB();
-
-        TypeDefinition imType = tdb.FindType("app.ItemManager");
-        if (imType == null)
+        TypeDefinition eqType = tdb.FindType("app.EquipManager");
+        if (eqType == null)
         {
-            API.LogWarning("[COOP-InvSync] app.ItemManager not found");
+            API.LogWarning("[COOP-InvSync] app.EquipManager not found");
             return;
         }
 
-        // Hook setItemGotFlag - fires when player acquires any item
-        Method gotFlag = imType.GetMethod("setItemGotFlag");
-        if (gotFlag != null)
+        // Hook equip changes to track what weapon the player has
+        Method eqWeapon = eqType.GetMethod("requestEquipWeapon");
+        if (eqWeapon != null)
         {
-            MethodHook.Create(gotFlag, false).AddPre(new MethodHook.PreHookDelegate(OnPreItemGot));
-            API.LogInfo("[COOP-InvSync] Hooked ItemManager.setItemGotFlag");
+            MethodHook.Create(eqWeapon, false).AddPre(new MethodHook.PreHookDelegate(OnPreEquipWeapon));
+            API.LogInfo("[COOP-InvSync] Hooked EquipManager.requestEquipWeapon");
         }
-
-        // Hook createItemInstance - item creation in world
-        Method createItem = imType.GetMethod("createItemInstance");
-        if (createItem != null)
-        {
-            MethodHook.Create(createItem, false).AddPost(new MethodHook.PostHookDelegate(OnPostCreateItem));
-            API.LogInfo("[COOP-InvSync] Hooked ItemManager.createItemInstance (post)");
-        }
-
-        // Dump ItemManager methods for reference
-        DumpMethods(imType, "ItemManager");
     }
 
-    static PreHookResult OnPreItemGot(Span<ulong> args)
+    static PreHookResult OnPreEquipWeapon(Span<ulong> args)
     {
         if (!CoopState.IsCoopActive) return PreHookResult.Continue;
 
         try
         {
-            // args[1] = this, args[2] = string itemID
-            string itemID = ReadStringArg(args, 2);
-            if (string.IsNullOrEmpty(itemID)) return PreHookResult.Continue;
-
-            if (IsWeapon(itemID))
-            {
-                // Check if we already shared this weapon
-                if (!_sharedWeapons.Contains(itemID))
-                {
-                    _sharedWeapons.Add(itemID);
-                    API.LogInfo("[COOP-InvSync] WEAPON acquired: " + itemID + " -> sharing with partner");
-                    BroadcastWeapon(itemID);
-                }
-            }
-            else
-            {
-                // Normal item - don't share, just log occasionally
-                if (CoopState.FrameCount % 60 == 0)
-                    API.LogInfo("[COOP-InvSync] Item acquired (private): " + itemID);
-            }
+            // Track the weapon ID for the ghost player visual
+            int weaponID = (int)(args[2] & 0xFFFFFFFF);
+            CoopState.LocalPlayer.WeaponID = weaponID;
+            API.LogInfo("[COOP-InvSync] Equipped weapon: " + weaponID);
         }
         catch { }
 
         return PreHookResult.Continue;
     }
 
-    static void OnPostCreateItem(ref ulong retval)
-    {
-        // Track item creation - primarily for logging
-    }
-
     // =====================================================================
-    //  REWARD SYNC - Unlock rewards on both sides
+    //  REWARD SYNC — Unlock rewards on both sides
     // =====================================================================
 
     static void SetupRewardHooks()
     {
         TDB tdb = API.GetTDB();
-
         TypeDefinition rmType = tdb.FindType("app.RewardManager");
         if (rmType == null)
         {
@@ -159,15 +121,12 @@ public class ResidentCOOP_InventorySync
             return;
         }
 
-        // Hook unlockReward - when a reward is unlocked locally
         Method unlock = rmType.GetMethod("unlockReward");
         if (unlock != null)
         {
             MethodHook.Create(unlock, false).AddPre(new MethodHook.PreHookDelegate(OnPreUnlockReward));
             API.LogInfo("[COOP-InvSync] Hooked RewardManager.unlockReward");
         }
-
-        DumpMethods(rmType, "RewardManager");
     }
 
     static PreHookResult OnPreUnlockReward(Span<ulong> args)
@@ -177,10 +136,11 @@ public class ResidentCOOP_InventorySync
         try
         {
             string rewardID = ReadStringArg(args, 2);
-            if (!string.IsNullOrEmpty(rewardID))
+            if (!string.IsNullOrEmpty(rewardID) && !_sentRewards.Contains(rewardID))
             {
+                _sentRewards.Add(rewardID);
                 API.LogInfo("[COOP-InvSync] Reward unlocked: " + rewardID + " -> syncing");
-                BroadcastReward(rewardID);
+                CallCoreSendRaw(NetProtocol.WriteRewardUnlock(rewardID));
             }
         }
         catch { }
@@ -200,38 +160,65 @@ public class ResidentCOOP_InventorySync
         try
         {
             CacheSingletons();
-            ProcessIncomingWeapon();
-            ProcessIncomingReward();
+
+            // Read current equipped weapon for partner display
+            ReadCurrentWeapon();
+
+            // Process pending rewards from network
+            ProcessPendingReward();
         }
         catch { }
     }
 
-    static void ProcessIncomingWeapon()
+    /// <summary>
+    /// Read current equipped weapon from EquipManager for partner display.
+    /// Updates CoopState.LocalPlayer.WeaponID.
+    /// </summary>
+    static void ReadCurrentWeapon()
     {
-        // Get pending weapon from Core via reflection
-        string weaponID = CallCoreConsume("ConsumePendingWeapon");
-        if (string.IsNullOrEmpty(weaponID)) return;
+        if (_equipMgr == null) return;
+        if (CoopState.FrameCount % 30 != 0) return; // every ~0.5s
 
-        API.LogInfo("[COOP-InvSync] Received weapon share: " + weaponID);
-
-        // Check if we have inventory space
-        bool hasSpace = CheckInventorySpace();
-        if (!hasSpace)
+        try
         {
-            API.LogInfo("[COOP-InvSync] Inventory full - cannot receive weapon: " + weaponID);
-            return;
+            dynamic weapon = _equipMgr.Call("get_equipWeaponRight");
+            if (weapon != null)
+            {
+                // Try to get weapon type ID
+                try
+                {
+                    int weaponType = (int)(weapon as ManagedObject).Call("get_WeaponType");
+                    CoopState.LocalPlayer.WeaponID = weaponType;
+                }
+                catch
+                {
+                    // Fallback: just mark as having a weapon (non-zero)
+                    CoopState.LocalPlayer.WeaponID = 1;
+                }
+            }
+            else
+            {
+                CoopState.LocalPlayer.WeaponID = 0; // no weapon
+            }
         }
-
-        // Give the weapon to the local player
-        GiveWeaponToPlayer(weaponID);
+        catch { }
     }
 
-    static void ProcessIncomingReward()
+    static void ProcessPendingReward()
     {
-        string rewardID = CallCoreConsume("ConsumePendingReward");
+        string rewardID = null;
+        lock (_pendingLock)
+        {
+            if (_pendingReward != null)
+            {
+                rewardID = _pendingReward;
+                _pendingReward = null;
+            }
+        }
+
         if (string.IsNullOrEmpty(rewardID)) return;
 
-        API.LogInfo("[COOP-InvSync] Received reward unlock: " + rewardID);
+        API.LogInfo("[COOP-InvSync] Received reward from partner: " + rewardID);
 
         if (_rewardMgr != null)
         {
@@ -249,179 +236,18 @@ public class ResidentCOOP_InventorySync
     }
 
     // =====================================================================
-    //  WEAPON IDENTIFICATION
-    //  RE7 weapon item IDs typically follow patterns like:
-    //    wp0000 (handgun), wp1000 (shotgun), wp2000 (burner), etc.
-    //  We check prefixes and also query ItemManager for bullet data.
+    //  PUBLIC: Called by Core when receiving network messages
     // =====================================================================
 
-    static bool IsWeapon(string itemID)
+    /// <summary>
+    /// Queue a reward unlock from the network.
+    /// </summary>
+    public static void QueueRewardUnlock(string rewardID)
     {
-        if (string.IsNullOrEmpty(itemID)) return false;
-
-        string lower = itemID.ToLower();
-
-        // Direct weapon ID patterns
-        if (lower.StartsWith("wp")) return true;
-        if (lower.Contains("weapon")) return true;
-        if (lower.Contains("gun")) return true;
-        if (lower.Contains("shotgun")) return true;
-        if (lower.Contains("pistol")) return true;
-        if (lower.Contains("knife")) return true;
-        if (lower.Contains("grenade")) return true;
-        if (lower.Contains("burner")) return true;
-        if (lower.Contains("flamethrower")) return true;
-        if (lower.Contains("machinegun")) return true;
-        if (lower.Contains("magnum")) return true;
-        if (lower.Contains("circular_saw")) return true;
-
-        // Check via ItemManager if this item has bullet data (= weapon)
-        if (_itemMgr != null)
+        lock (_pendingLock)
         {
-            try
-            {
-                var vmStr = REFrameworkNET.VM.CreateString(itemID);
-                dynamic bulletNum = _itemMgr.Call("getBulletNum", vmStr);
-                int num = (int)bulletNum;
-                if (num > 0) return true;
-            }
-            catch { }
+            _pendingReward = rewardID;
         }
-
-        return false;
-    }
-
-    // =====================================================================
-    //  INVENTORY SPACE CHECK
-    // =====================================================================
-
-    static bool CheckInventorySpace()
-    {
-        // Try via InventorySystem.getActivePlayerInventory
-        if (_inventorySys != null)
-        {
-            try
-            {
-                dynamic inv = _inventorySys.Call("getActivePlayerInventory");
-                if (inv != null)
-                {
-                    ManagedObject invMO = inv as ManagedObject;
-                    // Try to check if inventory is full
-                    try
-                    {
-                        dynamic isFull = invMO.Call("isFull");
-                        if ((bool)isFull) return false;
-                        return true;
-                    }
-                    catch { }
-
-                    // Try checking count vs capacity
-                    try
-                    {
-                        dynamic count = invMO.Call("get_Count");
-                        dynamic capacity = invMO.Call("get_Capacity");
-                        return (int)count < (int)capacity;
-                    }
-                    catch { }
-                }
-            }
-            catch { }
-        }
-
-        // If we can't determine, assume there's space
-        return true;
-    }
-
-    // =====================================================================
-    //  GIVE WEAPON TO PLAYER
-    // =====================================================================
-
-    static void GiveWeaponToPlayer(string weaponID)
-    {
-        if (_itemMgr == null) return;
-
-        try
-        {
-            // Get player GameObject
-            dynamic objectMgr = API.GetManagedSingleton("app.ObjectManager");
-            if (objectMgr == null) return;
-
-            dynamic playerObj = null;
-            try { playerObj = objectMgr.PlayerObj; }
-            catch { try { playerObj = (objectMgr as ManagedObject).Call("findActivePlayer"); } catch { } }
-
-            if (playerObj == null) return;
-
-            // Create the weapon item instance on the player
-            var vmWeaponID = REFrameworkNET.VM.CreateString(weaponID);
-            try
-            {
-                _itemMgr.Call("createItemInstance", playerObj, vmWeaponID);
-                API.LogInfo("[COOP-InvSync] Weapon given to player: " + weaponID);
-            }
-            catch
-            {
-                // Fallback: just set the got flag
-                try
-                {
-                    _itemMgr.Call("setItemGotFlag", vmWeaponID);
-                    API.LogInfo("[COOP-InvSync] Weapon flag set: " + weaponID);
-                }
-                catch (Exception e)
-                {
-                    API.LogError("[COOP-InvSync] Failed to give weapon: " + e.Message);
-                }
-            }
-        }
-        catch (Exception e)
-        {
-            API.LogError("[COOP-InvSync] GiveWeapon error: " + e.Message);
-        }
-    }
-
-    // =====================================================================
-    //  BROADCAST - Send weapon/reward to partner via Core
-    // =====================================================================
-
-    static void BroadcastWeapon(string weaponID)
-    {
-        try
-        {
-            Type coreType = FindType("ResidentCOOP_Core");
-            if (coreType != null)
-            {
-                coreType.GetMethod("BroadcastWeaponShare").Invoke(null, new object[] { weaponID });
-            }
-        }
-        catch { }
-    }
-
-    static void BroadcastReward(string rewardID)
-    {
-        try
-        {
-            Type coreType = FindType("ResidentCOOP_Core");
-            if (coreType != null)
-            {
-                coreType.GetMethod("BroadcastRewardUnlock").Invoke(null, new object[] { rewardID });
-            }
-        }
-        catch { }
-    }
-
-    static string CallCoreConsume(string methodName)
-    {
-        try
-        {
-            Type coreType = FindType("ResidentCOOP_Core");
-            if (coreType != null)
-            {
-                object result = coreType.GetMethod(methodName).Invoke(null, null);
-                return result as string;
-            }
-        }
-        catch { }
-        return null;
     }
 
     // =====================================================================
@@ -443,18 +269,6 @@ public class ResidentCOOP_InventorySync
         return null;
     }
 
-    static void DumpMethods(TypeDefinition type, string label)
-    {
-        try
-        {
-            var methods = type.GetMethods();
-            if (methods == null) return;
-            for (int i = 0; i < methods.Count; i++)
-                API.LogInfo("[COOP-InvSync]   " + label + ": " + methods[i].GetName());
-        }
-        catch { }
-    }
-
     static string ReadStringArg(Span<ulong> args, int index)
     {
         try
@@ -466,13 +280,33 @@ public class ResidentCOOP_InventorySync
         catch { return null; }
     }
 
-    static Type FindType(string name)
+    // =====================================================================
+    //  REFLECTION — Call Core plugin methods without direct reference
+    // =====================================================================
+
+    static Type _coreType = null;
+    static System.Reflection.MethodInfo _coreSendRaw = null;
+
+    static void CallCoreSendRaw(byte[] data)
     {
-        System.Reflection.Assembly[] asms = AppDomain.CurrentDomain.GetAssemblies();
-        for (int i = 0; i < asms.Length; i++)
+        try
         {
-            try { Type t = asms[i].GetType(name); if (t != null) return t; } catch { }
+            if (_coreType == null)
+            {
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    try { _coreType = asm.GetType("ResidentCOOP_Core"); if (_coreType != null) break; } catch { }
+                }
+            }
+            if (_coreType == null) return;
+
+            if (_coreSendRaw == null)
+                _coreSendRaw = _coreType.GetMethod("SendRaw",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+
+            if (_coreSendRaw != null)
+                _coreSendRaw.Invoke(null, new object[] { data });
         }
-        return null;
+        catch { }
     }
 }

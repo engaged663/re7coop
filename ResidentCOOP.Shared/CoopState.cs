@@ -114,6 +114,31 @@ namespace ResidentCOOP.Shared
         public static int SaveSlotToLoad = -1;    // -1 = none selected
         public static bool SessionStartRequested = false; // flag for GameSession plugin to act on
         public static bool SessionStarted = false;
+        public static int SelectedChapter = 2;            // ChapterNo enum value (2=Chapter0/GuestHouse, 4=Chapter1/MainHouse, etc.)
+        public static bool StartingItemsGiven = false;    // flag to give pistol + ammo once per chapter
+
+        // --- Stability window before creating inventory items (avoids crashes during scene activation) ---
+        // We only create starting items once we've observed the inventory in a 'healthy' state for this many
+        // consecutive frames. 180 frames ≈ 3 seconds at 60 FPS — enough for EnvActivateManager.folderActivate
+        // to finish and for all item prefabs' doAwake callbacks to have their required context.
+        public static int InventoryStableFrames = 0;
+        public const int RequiredStableFrames = 180;
+
+        // --- Chapter sync (host-authoritative) ---
+        // When the client connects, the host reports its current ChapterNo enum value so we can warn
+        // the client if they are on a different chapter (which would cause desync problems).
+        public static int HostCurrentChapter = -1;    // -1 means "unknown"
+        public static int LocalCurrentChapter = -1;
+        public static bool ChapterMismatch = false;
+        public static bool ForceSyncToHostRequested = false;  // UI sets this; GameSession consumes it
+
+
+
+        // --- Post-cutscene teleport ---
+        public static bool TeleportToHostRequested = false; // set by Cutscene plugin after cutscene ends
+
+        // --- Shared Game Over ---
+        public static bool SharedGameOverTriggered = false;  // one dies, all die
 
         // --- Save slot info (populated by GameSession plugin at runtime) ---
         public static string[] SaveSlotNames = new string[21]; // RE7 has up to 21 scenario slots
@@ -195,6 +220,8 @@ namespace ResidentCOOP.Shared
             SessionStartRequested = false;
             SessionStarted = false;
             SaveSlotsScanned = false;
+            TeleportToHostRequested = false;
+            SharedGameOverTriggered = false;
             PendingSceneLoads = new string[16];
             PendingSceneLoadActivate = new bool[16];
             PendingSceneLoadCount = 0;

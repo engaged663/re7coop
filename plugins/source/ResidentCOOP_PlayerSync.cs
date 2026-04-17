@@ -1,9 +1,16 @@
 // ResidentCOOP_PlayerSync.cs
 // Reads local player state (position, rotation, health) from RE7 game objects
 // and writes it into CoopState.LocalPlayer every frame.
+//
+// Uses app.ObjectManager.getPlayer() (confirmed from singleton dump) instead
+// of fragile PlayerObj field access.
+//
+// Also monitors player health for shared game over:
+// if health drops to 0 → broadcast GameOver to partner.
 
 using System;
 using REFrameworkNET;
+using REFrameworkNET.Attributes;
 using REFrameworkNET.Callbacks;
 
 using ResidentCOOP.Shared;
@@ -13,11 +20,14 @@ public class ResidentCOOP_PlayerSync
     // Cached type lookups (done once)
     static bool _typesResolved = false;
     static TypeDefinition _objectManagerType;
-    static TypeDefinition _inventoryTypeDef;
-    static TypeDefinition _playerOrderTypeDef;
-    static TypeDefinition _eventActionControllerTypeDef;
-    static object _inventoryRuntimeType;
+    static TypeDefinition _hpControllerType;
+    static TypeDefinition _playerOrderType;
+    static object _hpControllerRuntimeType;
     static object _playerOrderRuntimeType;
+
+    // Death tracking
+    static bool _wasAlive = true;
+    static int _deathCooldownFrames = 0;
 
     [PluginEntryPoint]
     public static void Main()
@@ -55,181 +65,172 @@ public class ResidentCOOP_PlayerSync
         }
     }
 
+    static int _typeRetryFrames = 0;
+
     static void ResolveTypes()
     {
-        if (_typesResolved) return;
+        // If fully resolved (ObjectManager + HitPointController), skip
+        if (_typesResolved && _hpControllerRuntimeType != null) return;
+
+        // Throttle retry to every ~2 seconds
+        if (_typesResolved && _typeRetryFrames > 0) { _typeRetryFrames--; return; }
+        _typeRetryFrames = 120;
 
         TDB tdb = API.GetTDB();
         if (tdb == null) return;
 
-        _objectManagerType = tdb.FindType("app.ObjectManager");
-        _inventoryTypeDef = tdb.FindType("app.Inventory");
-        _playerOrderTypeDef = tdb.FindType("app.PlayerOrder");
-        _eventActionControllerTypeDef = tdb.FindType("app.EventActionController");
+        if (_objectManagerType == null)
+            _objectManagerType = tdb.FindType("app.ObjectManager");
+        if (_hpControllerType == null)
+            _hpControllerType = tdb.FindType("app.HitPointController");
+        if (_playerOrderType == null)
+            _playerOrderType = tdb.FindType("app.PlayerOrder");
 
-        if (_inventoryTypeDef != null)
-            _inventoryRuntimeType = _inventoryTypeDef.GetRuntimeType();
-        if (_playerOrderTypeDef != null)
-            _playerOrderRuntimeType = _playerOrderTypeDef.GetRuntimeType();
+        if (_hpControllerType != null && _hpControllerRuntimeType == null)
+            _hpControllerRuntimeType = _hpControllerType.GetRuntimeType();
+        if (_playerOrderType != null && _playerOrderRuntimeType == null)
+            _playerOrderRuntimeType = _playerOrderType.GetRuntimeType();
 
+        bool wasResolved = _typesResolved;
         _typesResolved = (_objectManagerType != null);
 
-        if (_typesResolved)
-            API.LogInfo("[COOP-PlayerSync] Types resolved successfully.");
+        if (_typesResolved && !wasResolved)
+            API.LogInfo("[COOP-PlayerSync] Types resolved. HpCtrl=" +
+                (_hpControllerType != null) + " PlayerOrder=" + (_playerOrderType != null));
+
+        if (_hpControllerRuntimeType != null && wasResolved)
+            API.LogInfo("[COOP-PlayerSync] HitPointController now available!");
     }
 
     static void ReadLocalPlayerState()
     {
-        // Get player via app.ObjectManager singleton (confirmed from RE7.lua)
+        // Get player via app.ObjectManager.getPlayer() — confirmed from singleton dump
         dynamic objectManager = API.GetManagedSingleton("app.ObjectManager");
         if (objectManager == null) return;
 
         dynamic playerObj = null;
         try
         {
-            playerObj = objectManager.PlayerObj;
+            // Use getPlayer() method (from dump: "via.GameObject getPlayer()")
+            playerObj = (objectManager as ManagedObject).Call("getPlayer");
         }
         catch
         {
-            // Try field access pattern like the Lua does
+            // Fallback: try findActivePlayer()
             try
             {
-                playerObj = (objectManager as ManagedObject).GetField("PlayerObj");
+                playerObj = (objectManager as ManagedObject).Call("findActivePlayer");
             }
             catch { return; }
         }
 
         if (playerObj == null) return;
 
-        // Get transform for position/rotation
         ManagedObject playerMO = playerObj as ManagedObject;
         if (playerMO == null) return;
 
-        dynamic transform = null;
+        // ==== TRANSFORM (position + rotation) ====
+        ReadTransform(playerMO);
+
+        // ==== HEALTH ====
+        ReadPlayerHealth(playerMO);
+
+        // ==== FLAGS (aiming, crouching, running, flashlight) ====
+        ReadPlayerFlags(playerMO);
+
+        // ==== SHARED GAME OVER CHECK ====
+        CheckDeath();
+    }
+
+    // =====================================================================
+    //  TRANSFORM — Position and Rotation via typed proxy
+    // =====================================================================
+
+    static void ReadTransform(ManagedObject playerMO)
+    {
         try
         {
-            transform = playerMO.Call("get_Transform");
-        }
-        catch { return; }
+            dynamic transform = playerMO.Call("get_Transform");
+            if (transform == null) return;
 
-        if (transform == null) return;
-
-        // Read position
-        try
-        {
             ManagedObject transformMO = transform as ManagedObject;
             if (transformMO == null) return;
 
-            // Use typed proxy if available, otherwise dynamic
+            // Preferred: use typed proxy for direct struct access
             try
             {
-                var typedTransform = (transformMO as IObject).As<via.Transform>();
-                if (typedTransform != null)
+                var typed = (transformMO as IObject).As<via.Transform>();
+                if (typed != null)
                 {
-                    var pos = typedTransform.Position;
+                    var pos = typed.Position;
                     CoopState.LocalPlayer.PosX = pos.x;
                     CoopState.LocalPlayer.PosY = pos.y;
                     CoopState.LocalPlayer.PosZ = pos.z;
 
-                    // Rotation
-                    try
-                    {
-                        var rot = typedTransform.Rotation;
-                        CoopState.LocalPlayer.RotX = rot.x;
-                        CoopState.LocalPlayer.RotY = rot.y;
-                        CoopState.LocalPlayer.RotZ = rot.z;
-                        CoopState.LocalPlayer.RotW = rot.w;
-                    }
-                    catch { }
+                    var rot = typed.Rotation;
+                    CoopState.LocalPlayer.RotX = rot.x;
+                    CoopState.LocalPlayer.RotY = rot.y;
+                    CoopState.LocalPlayer.RotZ = rot.z;
+                    CoopState.LocalPlayer.RotW = rot.w;
+                    return;
                 }
             }
-            catch
+            catch { }
+
+            // Fallback: dynamic call
+            try
             {
-                // Fallback to dynamic calls
-                try
+                dynamic pos = transformMO.Call("get_Position");
+                if (pos != null)
                 {
-                    dynamic pos = transformMO.Call("get_Position");
-                    if (pos != null)
-                    {
-                        CoopState.LocalPlayer.PosX = (float)pos.x;
-                        CoopState.LocalPlayer.PosY = (float)pos.y;
-                        CoopState.LocalPlayer.PosZ = (float)pos.z;
-                    }
+                    CoopState.LocalPlayer.PosX = (float)pos.x;
+                    CoopState.LocalPlayer.PosY = (float)pos.y;
+                    CoopState.LocalPlayer.PosZ = (float)pos.z;
                 }
-                catch { }
+
+                dynamic rot = transformMO.Call("get_Rotation");
+                if (rot != null)
+                {
+                    CoopState.LocalPlayer.RotX = (float)rot.x;
+                    CoopState.LocalPlayer.RotY = (float)rot.y;
+                    CoopState.LocalPlayer.RotZ = (float)rot.z;
+                    CoopState.LocalPlayer.RotW = (float)rot.w;
+                }
             }
+            catch { }
         }
         catch { }
-
-        // Read health from the player condition
-        // RE7 uses RopewaySurvivorPlayerCondition but the exact field depends on the build
-        // Try multiple approaches
-        ReadPlayerHealth(playerMO);
-
-        // Read equipped weapon and flags
-        ReadPlayerFlags(playerMO);
     }
 
+    // =====================================================================
+    //  HEALTH — via HitPointController component on the player GO
+    // =====================================================================
+
+    /// <summary>
+    /// Read player health. Primary: HitPointController. No fallback to PlayerStatus
+    /// since get_HitPoint doesn't exist in RE7.
+    /// </summary>
     static void ReadPlayerHealth(ManagedObject playerObj)
     {
         try
         {
-            // Try getting the HitPointVital component or field
-            // In RE7, health can be accessed through various paths
-            // Approach 1: Look for a health-related component
-            dynamic hitPointCtrl = null;
-            try
+            // Approach 1: HitPointController (confirmed in RE7)
+            if (_hpControllerRuntimeType != null)
             {
-                var hpType = API.GetTDB().FindType("app.HitPointController");
-                if (hpType != null)
+                dynamic hitPointCtrl = playerObj.Call("getComponent(System.Type)", _hpControllerRuntimeType);
+                if (hitPointCtrl != null)
                 {
-                    var rtType = hpType.GetRuntimeType();
-                    if (rtType != null)
+                    try
                     {
-                        hitPointCtrl = playerObj.Call("getComponent(System.Type)", rtType);
+                        CoopState.LocalPlayer.Health = (float)(hitPointCtrl as ManagedObject).Call("get_CurrentHitPoint");
+                        CoopState.LocalPlayer.MaxHealth = (float)(hitPointCtrl as ManagedObject).Call("get_DefaultHitPoint");
+                        return;
                     }
+                    catch { }
                 }
             }
-            catch { }
 
-            if (hitPointCtrl != null)
-            {
-                try
-                {
-                    CoopState.LocalPlayer.Health = (float)(hitPointCtrl as ManagedObject).Call("get_CurrentHitPoint");
-                    CoopState.LocalPlayer.MaxHealth = (float)(hitPointCtrl as ManagedObject).Call("get_DefaultHitPoint");
-                    return;
-                }
-                catch { }
-            }
-
-            // Approach 2: Try through CharacterManager
-            try
-            {
-                dynamic charMgr = API.GetManagedSingleton("app.CharacterManager");
-                if (charMgr != null)
-                {
-                    dynamic manualPlayer = null;
-                    try { manualPlayer = charMgr.ManualPlayer; } catch { }
-                    if (manualPlayer != null)
-                    {
-                        try
-                        {
-                            dynamic hitCtrl = (manualPlayer as ManagedObject).Call("get_HitController");
-                            if (hitCtrl != null)
-                            {
-                                CoopState.LocalPlayer.Health = (float)(hitCtrl as ManagedObject).Call("get_CurrentHitPoint");
-                                CoopState.LocalPlayer.MaxHealth = (float)(hitCtrl as ManagedObject).Call("get_DefaultHitPoint");
-                                return;
-                            }
-                        }
-                        catch { }
-                    }
-                }
-            }
-            catch { }
-
-            // Fallback: set defaults
+            // Fallback: set reasonable defaults if we haven't read health yet
             if (CoopState.LocalPlayer.MaxHealth <= 0)
             {
                 CoopState.LocalPlayer.MaxHealth = 1000f;
@@ -239,29 +240,78 @@ public class ResidentCOOP_PlayerSync
         catch { }
     }
 
+    // =====================================================================
+    //  FLAGS — Disabled for now (RE7 doesn't expose these as simple getters)
+    //  get_IsCrouched, get_IsRunning, get_IsGrappleAimEnable do NOT exist
+    //  in RE7's app.PlayerOrder. Calling them causes REFramework internal
+    //  "Method not found" spam even inside try-catch.
+    // =====================================================================
+
     static void ReadPlayerFlags(ManagedObject playerObj)
     {
-        byte flags = 0;
+        // RE7 doesn't have simple bool getters for player states.
+        // Leave flags at 0 for now until we find the correct methods.
+        CoopState.LocalPlayer.Flags = 0;
+    }
 
+    // =====================================================================
+    //  SHARED GAME OVER — Detect player death and notify partner
+    // =====================================================================
+
+    static void CheckDeath()
+    {
+        if (_deathCooldownFrames > 0)
+        {
+            _deathCooldownFrames--;
+            return;
+        }
+
+        // Reset shared game over flag if we're alive
+        float hp = CoopState.LocalPlayer.Health;
+        float maxHp = CoopState.LocalPlayer.MaxHealth;
+
+        bool isAlive = (hp > 0f && maxHp > 0f);
+
+        if (_wasAlive && !isAlive)
+        {
+            // Player just died — broadcast game over to partner
+            API.LogInfo("[COOP-PlayerSync] Local player died! Broadcasting shared game over.");
+            CallCoreBroadcastGameOver();
+            _deathCooldownFrames = 120; // Don't spam for 2 seconds
+        }
+
+        _wasAlive = isAlive;
+
+        // Also reset shared game over state if we're alive
+        if (isAlive && CoopState.SharedGameOverTriggered)
+        {
+            CoopState.SharedGameOverTriggered = false;
+        }
+    }
+
+    // =====================================================================
+    //  REFLECTION — Call Core plugin methods without direct reference
+    // =====================================================================
+
+    static Type _coreType = null;
+
+    static void CallCoreBroadcastGameOver()
+    {
         try
         {
-            // Check PlayerOrder for aiming state
-            if (_playerOrderRuntimeType != null)
+            if (_coreType == null)
             {
-                dynamic order = playerObj.Call("getComponent(System.Type)", _playerOrderRuntimeType);
-                if (order != null)
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
                 {
-                    try
-                    {
-                        bool isGrappleAim = (bool)(order as ManagedObject).Call("get_IsGrappleAimEnable");
-                        if (isGrappleAim) flags |= 1; // isAiming
-                    }
-                    catch { }
+                    try { _coreType = asm.GetType("ResidentCOOP_Core"); if (_coreType != null) break; } catch { }
                 }
             }
+            if (_coreType == null) return;
+
+            var method = _coreType.GetMethod("BroadcastGameOver",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            if (method != null) method.Invoke(null, null);
         }
         catch { }
-
-        CoopState.LocalPlayer.Flags = flags;
     }
 }

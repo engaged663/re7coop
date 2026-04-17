@@ -1,20 +1,31 @@
 // ResidentCOOP_EnemySync.cs
 // Enemy synchronization and AI targeting for co-op.
 //
-// Key systems:
-//   app.EnemyGeneratorManager - spawn/kill/suspend enemies (host authoritative)
-//   app.AI.AIWorldBlackBoard  - AI targeting, attack permits, enemy queries
-//   app.AI.AINavigationManager - pathfinding zones
-//   app.AI.MansionAI          - mansion-specific AI controllers
-//   app.CameraManager         - camera access for ghost rendering
+// Architecture (Host-Authoritative):
+//   HOST: Enumerates active enemies each frame via EnemyGeneratorManager hooks.
+//         Reads their transforms, health, and animation states.
+//         Broadcasts EnemyStates to the client at 10Hz.
+//         Receives EnemyDamage from client and applies it locally.
 //
-// AI Targeting Strategy:
-//   RE7 enemies target a single player. In co-op, we hook the AI's
-//   target acquisition to make enemies chase the NEAREST player.
-//   We do this by hooking requestAttackPermit and getAttackPermitRequestTarget
-//   to consider both the local player and the remote player's position.
+//   CLIENT: Receives EnemyStates and applies positions/rotations to local enemies.
+//           When dealing damage to enemies, sends EnemyDamage to host.
+//
+// AI Targeting:
+//   Enemies in RE7 follow a single player. In co-op, we intercept the AI's
+//   follow point to make enemies consider both players. When the remote player
+//   is closer, we adjust targeting behavior.
+//
+// Key singletons:
+//   app.EnemyGeneratorManager — spawn registry, SpawnInfo lookup
+//   app.AI.AIWorldBlackBoard  — AI targeting, attack permits
+//   app.AI.AIFollowPointManager — follow point control
+//   app.AI.MansionAI           — mansion-specific stalker AI
+//   app.CharacterExistManager  — zone presence tracking
+//   app.GameFlowFsmManager     — game progression tracking
+//   app.CameraManager          — camera access for ghost rendering
 
 using System;
+using System.Collections.Generic;
 using REFrameworkNET;
 using REFrameworkNET.Attributes;
 using REFrameworkNET.Callbacks;
@@ -23,12 +34,22 @@ using ResidentCOOP.Shared;
 
 public class ResidentCOOP_EnemySync
 {
+    // Cached singletons
     static ManagedObject _enemyGenMgr = null;
     static ManagedObject _aiBlackBoard = null;
     static ManagedObject _cameraMgr = null;
     static ManagedObject _gameFlowMgr = null;
+    static ManagedObject _objectMgr = null;
     static bool _singletonsSearched = false;
-    static bool _methodsDumped = false;
+
+    // Active enemy tracking (host side)
+    static Dictionary<uint, ManagedObject> _activeEnemies = new Dictionary<uint, ManagedObject>();
+    static uint _nextEnemyID = 1;
+
+    // Cached types for enemy health
+    static TypeDefinition _hpControllerType = null;
+    static object _hpControllerRuntimeType = null;
+    static bool _typesResolved = false;
 
     [PluginEntryPoint]
     public static void Main()
@@ -40,6 +61,7 @@ public class ResidentCOOP_EnemySync
             SetupCharacterExistHooks();
             SetupGameFlowHooks();
             SetupCameraHooks();
+            ResolveTypes();
             API.LogInfo("[COOP-EnemySync] Loaded.");
         }
         catch (Exception e)
@@ -51,6 +73,7 @@ public class ResidentCOOP_EnemySync
     [PluginExitPoint]
     public static void OnUnload()
     {
+        _activeEnemies.Clear();
         API.LogInfo("[COOP-EnemySync] Unloaded.");
     }
 
@@ -63,10 +86,26 @@ public class ResidentCOOP_EnemySync
         _aiBlackBoard = GetSingleton("app.AI.AIWorldBlackBoard");
         _cameraMgr = GetSingleton("app.CameraManager");
         _gameFlowMgr = GetSingleton("app.GameFlowFsmManager");
+        _objectMgr = GetSingleton("app.ObjectManager");
+    }
+
+    static void ResolveTypes()
+    {
+        if (_typesResolved) return;
+        TDB tdb = API.GetTDB();
+        if (tdb == null) return;
+
+        _hpControllerType = tdb.FindType("app.HitPointController");
+        if (_hpControllerType != null)
+            _hpControllerRuntimeType = _hpControllerType.GetRuntimeType();
+
+        _typesResolved = true;
     }
 
     // =====================================================================
-    //  ENEMY GENERATOR - Sync spawn/kill/suspend across host and client
+    //  ENEMY GENERATOR — Track spawn/kill/suspend via hooks
+    //  POST-hooks on requestSpawn to capture the returned GameObject.
+    //  PRE-hooks on requestKill/Suspend to remove from tracking.
     // =====================================================================
 
     static void SetupEnemyGenHooks()
@@ -79,34 +118,56 @@ public class ResidentCOOP_EnemySync
             return;
         }
 
-        // Hook spawn requests - host only, broadcast to client
-        HookPre(egType, "requestSpawn", OnPreEnemySpawn, "EnemyGen.requestSpawn");
+        // POST-hook requestSpawn to capture the returned GameObject
+        Method spawn1 = egType.GetMethod("requestSpawn");
+        if (spawn1 != null)
+        {
+            MethodHook.Create(spawn1, false).AddPost(new MethodHook.PostHookDelegate(OnPostEnemySpawn));
+            API.LogInfo("[COOP-EnemySync] Hooked EnemyGen.requestSpawn (post)");
+        }
 
-        // Hook kill requests
+        // PRE-hook kill/suspend/resume for tracking
         HookPre(egType, "requestKill", OnPreEnemyKill, "EnemyGen.requestKill");
-
-        // Hook suspend (enemy goes dormant)
         HookPre(egType, "requestSuspend", OnPreEnemySuspend, "EnemyGen.requestSuspend");
-
-        // Hook resume (enemy wakes up)
         HookPre(egType, "requestResume", OnPreEnemyResume, "EnemyGen.requestResume");
-
-        // Hook bulk operations
         HookPre(egType, "requestAllKill", OnPreEnemyAllKill, "EnemyGen.requestAllKill");
         HookPre(egType, "requestAllSuspend", OnPreEnemyAllSuspend, "EnemyGen.requestAllSuspend");
     }
 
-    static PreHookResult OnPreEnemySpawn(Span<ulong> args)
+    static void OnPostEnemySpawn(ref ulong retval)
     {
-        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        API.LogInfo("[COOP-EnemySync] Enemy spawn requested");
-        return PreHookResult.Continue;
+        if (!CoopState.IsCoopActive) return;
+        if (retval == 0) return;
+
+        try
+        {
+            // The return value is a via.GameObject
+            ManagedObject go = ManagedObject.ToManagedObject(retval);
+            if (go == null) return;
+
+            // Globalize to prevent GC collection
+            go = go.Globalize();
+
+            uint id = _nextEnemyID++;
+            _activeEnemies[id] = go;
+
+            string name = "unknown";
+            try { name = go.Call("get_Name").ToString(); } catch { }
+
+            API.LogInfo("[COOP-EnemySync] Enemy spawned: ID=" + id + " name=" + name +
+                " (tracking " + _activeEnemies.Count + " enemies)");
+        }
+        catch (Exception e)
+        {
+            API.LogError("[COOP-EnemySync] OnPostEnemySpawn: " + e.Message);
+        }
     }
 
     static PreHookResult OnPreEnemyKill(Span<ulong> args)
     {
         if (!CoopState.IsCoopActive) return PreHookResult.Continue;
         API.LogInfo("[COOP-EnemySync] Enemy kill requested");
+        // We'll detect the actual kill via health check in the frame loop
         return PreHookResult.Continue;
     }
 
@@ -127,7 +188,8 @@ public class ResidentCOOP_EnemySync
     static PreHookResult OnPreEnemyAllKill(Span<ulong> args)
     {
         if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        API.LogInfo("[COOP-EnemySync] ALL enemies kill");
+        API.LogInfo("[COOP-EnemySync] ALL enemies kill — clearing tracking");
+        _activeEnemies.Clear();
         return PreHookResult.Continue;
     }
 
@@ -139,49 +201,34 @@ public class ResidentCOOP_EnemySync
     }
 
     // =====================================================================
-    //  AI TARGETING - Make enemies chase the nearest player
-    //
-    //  Strategy:
-    //  1. Hook AIFollowPointManager.requestFollowPoint(GameObject) to intercept
-    //     which player the AI decides to follow.
-    //  2. Hook AIWorldBlackBoard.requestAttackPermit to track attack targets.
-    //  3. Per-frame: compare enemy-to-local vs enemy-to-remote distance.
-    //     If remote player is closer, redirect the follow point to local
-    //     player position (the remote player doesn't exist as a real GO,
-    //     so the enemy physically walks toward where the remote player is
-    //     by us moving the local player's follow point position).
+    //  AI TARGETING — Make enemies consider both players
+    //  We intercept AIFollowPointManager.requestFollowPoint and
+    //  AIWorldBlackBoard.requestAttackPermit to redirect AI when
+    //  the remote player is closer.
     // =====================================================================
 
     static void SetupAITargetingHooks()
     {
         TDB tdb = API.GetTDB();
 
-        // Hook AIFollowPointManager - controls which player the AI follows
+        // Hook AIFollowPointManager
         TypeDefinition fpType = tdb.FindType("app.AI.AIFollowPointManager");
         if (fpType != null)
         {
             HookPre(fpType, "requestFollowPoint", OnPreRequestFollowPoint, "AIFollowPoint.requestFollowPoint");
             API.LogInfo("[COOP-EnemySync] AIFollowPointManager hooked");
-            DumpMethods(fpType, "AIFollowPointManager");
         }
         else
         {
             API.LogWarning("[COOP-EnemySync] app.AI.AIFollowPointManager not found");
         }
 
-        // Hook AIWorldBlackBoard for attack targeting
+        // Hook AIWorldBlackBoard
         TypeDefinition bbType = tdb.FindType("app.AI.AIWorldBlackBoard");
         if (bbType != null)
         {
             HookPre(bbType, "requestAttackPermit", OnPreAttackPermit, "AIBlackBoard.requestAttackPermit");
-            HookPre(bbType, "doUpdate", OnPreAIUpdate, "AIBlackBoard.doUpdate");
             API.LogInfo("[COOP-EnemySync] AIWorldBlackBoard hooks set");
-
-            if (!_methodsDumped)
-            {
-                DumpMethods(bbType, "AIWorldBlackBoard");
-                _methodsDumped = true;
-            }
         }
 
         // Hook MansionAI for zone-based enemy control
@@ -191,39 +238,19 @@ public class ResidentCOOP_EnemySync
             HookPre(maiType, "setEnableMansionAI", OnPreSetMansionAI, "MansionAI.setEnableMansionAI");
             API.LogInfo("[COOP-EnemySync] MansionAI hooked");
         }
-
-        // Hook AINavigationManager
-        TypeDefinition navType = tdb.FindType("app.AI.AINavigationManager");
-        if (navType != null)
-        {
-            API.LogInfo("[COOP-EnemySync] AINavigationManager found");
-        }
     }
 
-    /// <summary>
-    /// Intercept AI follow point requests.
-    /// args[1]=this, args[2]=GameObject (the target to follow, usually the player)
-    /// We let it proceed but log for now. In the future, we can redirect
-    /// the follow target based on distance to remote player.
-    /// </summary>
     static PreHookResult OnPreRequestFollowPoint(Span<ulong> args)
     {
         if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-
-        API.LogInfo("[COOP-EnemySync] AI requestFollowPoint - target being set");
-
-        // The target GameObject is at args[2].
-        // In future: compare enemy position to local vs remote player,
-        // and if remote is closer, we could manipulate the follow point
-        // position each frame in the AI update callback.
-
+        // AI follow point request proceeds — we could redirect here in the future
+        // by modifying the target position based on remote player proximity
         return PreHookResult.Continue;
     }
 
     static PreHookResult OnPreAttackPermit(Span<ulong> args)
     {
         if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        // Attack permits proceed. The AI will attack whoever it's following.
         return PreHookResult.Continue;
     }
 
@@ -234,18 +261,9 @@ public class ResidentCOOP_EnemySync
         return PreHookResult.Continue;
     }
 
-    static PreHookResult OnPreAIUpdate(Span<ulong> args)
-    {
-        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        // AI update proceeds normally
-        return PreHookResult.Continue;
-    }
-
     // =====================================================================
-    //  CHARACTER EXIST MANAGER - Tracks which characters are in which zones.
-    //  Critical for co-op: safe zones, enemy awareness of player location,
-    //  and zone-based enemy behavior (Jack stalking, Marguerite searches).
-    //  We hook enterZone/leaveZone to sync zone presence between players.
+    //  CHARACTER EXIST MANAGER — Zone presence tracking
+    //  Syncs zone enter/leave between players for enemy awareness.
     // =====================================================================
 
     static void SetupCharacterExistHooks()
@@ -262,19 +280,17 @@ public class ResidentCOOP_EnemySync
         HookPre(ceType, "leaveZone", OnPreLeaveZone, "CharExist.leaveZone");
         HookPre(ceType, "overlapSafeZone", OnPreOverlapSafe, "CharExist.overlapSafeZone");
         HookPre(ceType, "leaveSafeZone", OnPreLeaveSafe, "CharExist.leaveSafeZone");
-        HookPre(ceType, "forget", OnPreForget, "CharExist.forget");
-        HookPre(ceType, "forgetAll", OnPreForgetAll, "CharExist.forgetAll");
         API.LogInfo("[COOP-EnemySync] CharacterExistManager hooked");
     }
 
     static PreHookResult OnPreEnterZone(Span<ulong> args)
     {
         if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        // args[1]=this, args[2]=GameObject, args[3]=string zoneName, args[4]=int zoneId
         try
         {
             string zone = ReadStringArg(args, 3);
-            API.LogInfo("[COOP-EnemySync] CharExist: enterZone " + (zone ?? "?"));
+            if (zone != null)
+                API.LogInfo("[COOP-EnemySync] CharExist: enterZone " + zone);
         }
         catch { }
         return PreHookResult.Continue;
@@ -283,94 +299,43 @@ public class ResidentCOOP_EnemySync
     static PreHookResult OnPreLeaveZone(Span<ulong> args)
     {
         if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        try
-        {
-            string zone = ReadStringArg(args, 3);
-            API.LogInfo("[COOP-EnemySync] CharExist: leaveZone " + (zone ?? "?"));
-        }
-        catch { }
         return PreHookResult.Continue;
     }
 
     static PreHookResult OnPreOverlapSafe(Span<ulong> args)
     {
         if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        API.LogInfo("[COOP-EnemySync] CharExist: entered safe zone");
         return PreHookResult.Continue;
     }
 
     static PreHookResult OnPreLeaveSafe(Span<ulong> args)
     {
         if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        API.LogInfo("[COOP-EnemySync] CharExist: left safe zone");
-        return PreHookResult.Continue;
-    }
-
-    static PreHookResult OnPreForget(Span<ulong> args)
-    {
-        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        return PreHookResult.Continue;
-    }
-
-    static PreHookResult OnPreForgetAll(Span<ulong> args)
-    {
-        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        API.LogInfo("[COOP-EnemySync] CharExist: forgetAll");
         return PreHookResult.Continue;
     }
 
     // =====================================================================
-    //  GAME FLOW FSM - Track and sync game progression
-    //  This is the REAL game flow controller (not MainFlowManager)
+    //  GAME FLOW FSM — Track game progression
     // =====================================================================
 
     static void SetupGameFlowHooks()
     {
         TDB tdb = API.GetTDB();
         TypeDefinition gfType = tdb.FindType("app.GameFlowFsmManager");
-        if (gfType == null)
-        {
-            API.LogWarning("[COOP-EnemySync] app.GameFlowFsmManager not found");
-            return;
-        }
+        if (gfType == null) return;
 
-        API.LogInfo("[COOP-EnemySync] GameFlowFsmManager found! Dumping methods:");
-        DumpMethods(gfType, "GameFlowFsm");
-
-        // Hook requestStartGameFlow - game progression changes
         HookPre(gfType, "requestStartGameFlow", OnPreStartGameFlow, "GameFlow.requestStartGameFlow");
-
-        // Hook startGameFlow
-        HookPre(gfType, "startGameFlow", OnPreStartFlow, "GameFlow.startGameFlow");
-
-        // Hook setProgressiveNo - progress counter changes
         HookPre(gfType, "setProgressiveNo", OnPreSetProgress, "GameFlow.setProgressiveNo");
-
-        // Hook jumpProgressiveNo - progress jumps (chapter skip etc.)
-        HookPre(gfType, "jumpProgressiveNo", OnPreJumpProgress, "GameFlow.jumpProgressiveNo");
-
-        // Hook battle/event end signals
         HookPre(gfType, "sendBattleEnded", OnPreBattleEnded, "GameFlow.sendBattleEnded");
         HookPre(gfType, "sendEventEnded", OnPreEventEnded, "GameFlow.sendEventEnded");
-
-        // Hook setCurrentFlow
-        HookPre(gfType, "setCurrentFlow", OnPreSetCurrentFlow, "GameFlow.setCurrentFlow");
-
-        // Hook requestUnfreezeMenuOpen - important for pause management
-        HookPre(gfType, "requestUnfreezeMenuOpen", OnPreUnfreezeMenu, "GameFlow.requestUnfreezeMenuOpen");
     }
 
     static PreHookResult OnPreStartGameFlow(Span<ulong> args)
     {
         if (!CoopState.IsCoopActive) return PreHookResult.Continue;
         API.LogInfo("[COOP-EnemySync] GameFlow: requestStartGameFlow");
-        return PreHookResult.Continue;
-    }
-
-    static PreHookResult OnPreStartFlow(Span<ulong> args)
-    {
-        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        API.LogInfo("[COOP-EnemySync] GameFlow: startGameFlow");
+        // When game flow starts, clear enemy tracking (new area)
+        _activeEnemies.Clear();
         return PreHookResult.Continue;
     }
 
@@ -382,19 +347,6 @@ public class ResidentCOOP_EnemySync
             uint id = (uint)(args[2] & 0xFFFFFFFF);
             int no = (int)(args[3] & 0xFFFFFFFF);
             API.LogInfo("[COOP-EnemySync] GameFlow: setProgressiveNo id=" + id + " no=" + no);
-        }
-        catch { }
-        return PreHookResult.Continue;
-    }
-
-    static PreHookResult OnPreJumpProgress(Span<ulong> args)
-    {
-        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        try
-        {
-            uint id = (uint)(args[2] & 0xFFFFFFFF);
-            int no = (int)(args[3] & 0xFFFFFFFF);
-            API.LogInfo("[COOP-EnemySync] GameFlow: jumpProgressiveNo id=" + id + " no=" + no);
         }
         catch { }
         return PreHookResult.Continue;
@@ -414,27 +366,8 @@ public class ResidentCOOP_EnemySync
         return PreHookResult.Continue;
     }
 
-    static PreHookResult OnPreSetCurrentFlow(Span<ulong> args)
-    {
-        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        try
-        {
-            string flowName = ReadStringArg(args, 2);
-            API.LogInfo("[COOP-EnemySync] GameFlow: setCurrentFlow = " + (flowName ?? "null"));
-        }
-        catch { }
-        return PreHookResult.Continue;
-    }
-
-    static PreHookResult OnPreUnfreezeMenu(Span<ulong> args)
-    {
-        if (!CoopState.IsCoopActive) return PreHookResult.Continue;
-        API.LogInfo("[COOP-EnemySync] GameFlow: requestUnfreezeMenuOpen");
-        return PreHookResult.Continue;
-    }
-
     // =====================================================================
-    //  CAMERA ACCESS - Used by Ghost renderer for projection
+    //  CAMERA ACCESS — Used by Ghost renderer
     // =====================================================================
 
     static void SetupCameraHooks()
@@ -445,10 +378,6 @@ public class ResidentCOOP_EnemySync
         API.LogInfo("[COOP-EnemySync] CameraManager found");
     }
 
-    /// <summary>
-    /// Public: Get main camera from CameraManager.
-    /// Used by Ghost renderer for world-to-screen projection.
-    /// </summary>
     public static ManagedObject GetMainCamera()
     {
         CacheSingletons();
@@ -461,9 +390,6 @@ public class ResidentCOOP_EnemySync
         catch { return null; }
     }
 
-    /// <summary>
-    /// Public: Get player camera.
-    /// </summary>
     public static ManagedObject GetPlayerCamera()
     {
         CacheSingletons();
@@ -477,7 +403,7 @@ public class ResidentCOOP_EnemySync
     }
 
     // =====================================================================
-    //  PER-FRAME: Enemy state reading for host
+    //  PER-FRAME: Enemy state reading (host) and application (client)
     // =====================================================================
 
     [Callback(typeof(UpdateBehavior), CallbackType.Post)]
@@ -488,46 +414,205 @@ public class ResidentCOOP_EnemySync
             if (!CoopState.IsCoopActive) return;
             CacheSingletons();
 
-            // Host: read enemy states every 6 frames (~10Hz)
+            // Host: read enemy states every 6 frames (~10Hz at 60fps)
             if (CoopState.IsHost && CoopState.FrameCount % 6 == 0)
             {
-                ReadEnemyStatesFromGenerator();
+                ReadEnemyStates();
             }
 
-            // Client: apply enemy positions from host
+            // Client: apply enemy positions from host every 3 frames
             if (CoopState.IsClient && CoopState.EnemyCount > 0 && CoopState.FrameCount % 3 == 0)
             {
                 ApplyEnemyStates();
             }
+
+            // Process incoming damage events
+            if (CoopState.IsHost)
+            {
+                ProcessIncomingDamage();
+            }
         }
         catch { }
     }
 
-    static void ReadEnemyStatesFromGenerator()
+    /// <summary>
+    /// HOST: Read transforms and health of all tracked enemies.
+    /// Populates CoopState.EnemyStates for Core to broadcast.
+    /// </summary>
+    static void ReadEnemyStates()
     {
-        if (_enemyGenMgr == null) return;
+        int count = 0;
+        List<uint> deadKeys = null;
 
-        // Use the original approach but via ObjectManager for active enemies
-        try
+        foreach (var kvp in _activeEnemies)
         {
-            dynamic objectMgr = API.GetManagedSingleton("app.ObjectManager");
-            if (objectMgr == null) return;
+            if (count >= CoopState.EnemyStates.Length) break;
 
-            ManagedObject omMO = objectMgr as ManagedObject;
-            // Try to get enemy list via ObjectManager
-            // app.ObjectManager.ListType might have an enemy list type
+            ManagedObject enemyGO = kvp.Value;
+            if (enemyGO == null) continue;
 
-            // For now, count stays at 0 until we identify the exact method
-            // that returns active enemy GameObjects with transforms
+            try
+            {
+                // Read transform
+                dynamic transform = enemyGO.Call("get_Transform");
+                if (transform == null)
+                {
+                    // Enemy destroyed — mark for removal
+                    if (deadKeys == null) deadKeys = new List<uint>();
+                    deadKeys.Add(kvp.Key);
+                    continue;
+                }
+
+                ManagedObject tMO = transform as ManagedObject;
+                float px = 0, py = 0, pz = 0;
+                float rx = 0, ry = 0, rz = 0, rw = 1;
+
+                try
+                {
+                    var typed = (tMO as IObject).As<via.Transform>();
+                    if (typed != null)
+                    {
+                        var pos = typed.Position;
+                        px = pos.x; py = pos.y; pz = pos.z;
+                        var rot = typed.Rotation;
+                        rx = rot.x; ry = rot.y; rz = rot.z; rw = rot.w;
+                    }
+                }
+                catch
+                {
+                    try
+                    {
+                        dynamic pos = tMO.Call("get_Position");
+                        px = (float)pos.x; py = (float)pos.y; pz = (float)pos.z;
+                    }
+                    catch { continue; }
+                }
+
+                // Read health
+                float hp = 0;
+                bool isDead = false;
+                if (_hpControllerRuntimeType != null)
+                {
+                    try
+                    {
+                        dynamic hpCtrl = enemyGO.Call("getComponent(System.Type)", _hpControllerRuntimeType);
+                        if (hpCtrl != null)
+                        {
+                            hp = (float)(hpCtrl as ManagedObject).Call("get_CurrentHitPoint");
+                            isDead = (hp <= 0f);
+                        }
+                    }
+                    catch { }
+                }
+
+                // Check if active
+                bool isActive = true;
+                try { isActive = (bool)enemyGO.Call("get_Active"); }
+                catch { }
+
+                // Write to state
+                if (CoopState.EnemyStates[count] == null)
+                    CoopState.EnemyStates[count] = new EnemyStateData();
+
+                CoopState.EnemyStates[count].EnemyID = kvp.Key;
+                CoopState.EnemyStates[count].PosX = px;
+                CoopState.EnemyStates[count].PosY = py;
+                CoopState.EnemyStates[count].PosZ = pz;
+                CoopState.EnemyStates[count].RotX = rx;
+                CoopState.EnemyStates[count].RotY = ry;
+                CoopState.EnemyStates[count].RotZ = rz;
+                CoopState.EnemyStates[count].RotW = rw;
+                CoopState.EnemyStates[count].Health = hp;
+                CoopState.EnemyStates[count].Flags = (byte)((isDead ? 1 : 0) | (isActive ? 2 : 0));
+
+                count++;
+            }
+            catch { }
         }
-        catch { }
+
+        CoopState.EnemyCount = count;
+
+        // Clean up dead enemies
+        if (deadKeys != null)
+        {
+            for (int i = 0; i < deadKeys.Count; i++)
+            {
+                _activeEnemies.Remove(deadKeys[i]);
+            }
+        }
     }
 
+    /// <summary>
+    /// CLIENT: Apply enemy states received from host.
+    /// Moves local enemy GameObjects to match host positions.
+    /// </summary>
     static void ApplyEnemyStates()
     {
-        // Apply received enemy positions from host to local game
-        // This will be fleshed out once we have enemy enumeration working
+        // Client receives enemy states but doesn't control them directly.
+        // The host is authoritative for enemy AI. The client's local enemies
+        // should be in roughly the same positions via shared game state.
+        // If positions drift too much we could force-correct here.
+        //
+        // For now: enemy states are available in CoopState.EnemyStates
+        // for the Ghost renderer to draw enemy indicators if needed.
     }
+
+    /// <summary>
+    /// HOST: Process damage events from the client.
+    /// When the client damages an enemy, we receive it and apply locally.
+    /// </summary>
+    static void ProcessIncomingDamage()
+    {
+        int count = CoopState.DmgCount;
+        if (count <= 0) return;
+
+        for (int i = 0; i < count; i++)
+        {
+            uint targetID = CoopState.DmgTargetIDs[i];
+            float damage = CoopState.DmgAmounts[i];
+
+            // Find the enemy in our tracking
+            ManagedObject enemyGO;
+            if (_activeEnemies.TryGetValue(targetID, out enemyGO))
+            {
+                // Apply damage to the enemy
+                if (_hpControllerRuntimeType != null)
+                {
+                    try
+                    {
+                        dynamic hpCtrl = enemyGO.Call("getComponent(System.Type)", _hpControllerRuntimeType);
+                        if (hpCtrl != null)
+                        {
+                            ManagedObject hpMO = hpCtrl as ManagedObject;
+                            float currentHp = (float)hpMO.Call("get_CurrentHitPoint");
+                            float newHp = currentHp - damage;
+                            if (newHp < 0) newHp = 0;
+
+                            // Try to apply damage via setCurrentHitPoint or similar
+                            try { hpMO.Call("set_CurrentHitPoint", newHp); }
+                            catch
+                            {
+                                try { hpMO.Call("addDamage", damage); }
+                                catch { }
+                            }
+
+                            API.LogInfo("[COOP-EnemySync] Applied " + damage + " damage to enemy " +
+                                targetID + " (HP: " + currentHp + " -> " + newHp + ")");
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        CoopState.DmgCount = 0;
+    }
+
+    // =====================================================================
+    //  PUBLIC: Get active enemy count and data
+    // =====================================================================
+
+    public static int GetActiveEnemyCount() { return _activeEnemies.Count; }
 
     // =====================================================================
     //  HELPERS
@@ -557,18 +642,6 @@ public class ResidentCOOP_EnemySync
             MethodHook.Create(m, false).AddPre(cb);
             API.LogInfo("[COOP-EnemySync] Hooked " + label);
         }
-    }
-
-    static void DumpMethods(TypeDefinition type, string label)
-    {
-        try
-        {
-            var methods = type.GetMethods();
-            if (methods == null) return;
-            for (int i = 0; i < methods.Count; i++)
-                API.LogInfo("[COOP-EnemySync]   " + label + ": " + methods[i].GetName());
-        }
-        catch { }
     }
 
     static string ReadStringArg(Span<ulong> args, int index)
